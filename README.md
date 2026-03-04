@@ -2,7 +2,7 @@
 
 A local-first agent that evaluates GitHub issue/PR comments for sentiment using **OLMo 2 1B Instruct** — a fully open-source LLM trained on fully open data.
 
-> This is really just a sandbox for experimenting and learning about how data informs decisions, and to play with ways of visualizing that and providing additional prompts via the examples.json file.  I last experimented with adding prompts related to evalauting sentiment related to the 3.0 verison of the Contributor Covenant.
+> This is really just a sandbox for experimenting and learning about how data informs decisions, what type of transparency is possible with open data an models -  AND to play with ways of visualizing that and providing additional prompts via the examples.json file.  I last experimented with adding prompts related to evalauting sentiment related to the 3.0 verison of the Contributor Covenant.
 
 ## Why This Stack?
 
