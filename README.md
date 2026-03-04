@@ -1,4 +1,4 @@
-# 🔍 GitHub Comment Sentiment Agent
+# 🔍 View Source AI Experiments 
 
 A local-first agent that evaluates GitHub issue/PR comments for sentiment using **OLMo 2 1B Instruct** — a fully open-source LLM trained on fully open data.
 
