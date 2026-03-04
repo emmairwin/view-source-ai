@@ -4,6 +4,8 @@ A local-first agent that evaluates GitHub issue/PR comments for sentiment using 
 
 > This is really just a sandbox for experimenting and learning about how data informs decisions, what type of transparency is possible with open data an models -  AND to play with ways of visualizing that and providing additional prompts via the examples.json file.  I last experimented with adding prompts related to evalauting sentiment related to the 3.0 verison of the Contributor Covenant.
 
+I am aware there are disagreements around openness and AI, with regard to safety, but think of this as a teaching tool and not a proposed solution, and you'll be fine.
+
 ## Why This Stack?
 
 | Component | Choice | Why It's Truly Open |
