@@ -1,12 +1,36 @@
-# GitHub Comment Sentiment Agent — Project Summary
+# 🦴 Fossil Record — Project Summary
 
 ## What It Is
 
-A local-first tool that analyzes GitHub issue/PR comments for toxicity, constructiveness, and custom sentiment labels you define. Built entirely on genuinely open-source components — no black boxes.
+Fossil Record is a code provenance tool that searches [Dolma](https://huggingface.co/datasets/allenai/dolma) — the fully open 3-trillion-token dataset used to train OLMo — to find traces of your code in AI training data. It shows where code appears, how many times, what license it carried in those documents, and whether that license is compatible with your project.
 
-## Why It Matters
+## The Idea
 
-This isn't just another sentiment classifier. The core idea is **"View Source" for AI** — inspired by how early web browsers let you see and modify what made a page work. Every decision the model makes can be traced back to its training data, explained, and changed.
+When AI trains on code, that code leaves an impression — like a fossil in rock. The fossil record isn't complete (deduplication, missing headers, minified bundles), but fragments are readable. A single distinctive function signature is enough to identify the library, its license, and its training history. This tool reads those fragments.
+
+## The Stack
+
+| Component | Choice |
+|-----------|--------|
+| **Training corpus** | Dolma v1.7 (3T tokens, fully open) |
+| **Search API** | infini-gram (exact n-gram search) |
+| **UI** | Gradio (local, no cloud) |
+| **License** | Apache 2.0 |
+
+## Four Capabilities
+
+1. **Trace** — exact-phrase search of code snippets against the full Dolma corpus
+2. **Inspect** — source document context + detected license strings for each match  
+3. **Flag** — 🟢/🟡/🔴/⚪ license compatibility between training sources and your project
+4. **Contribute** — structured issue reports to Allen AI's open repos with evidence pre-filled
+
+## Known Limitations
+
+- Exact-phrase only — minified/reformatted code won't match
+- Deduplication means counts reflect corpus uniqueness, not real-world prevalence
+- 800-char document window may not reach a file's license header
+- Pattern bank (examples.jsonl) fills license gaps but uses keyword overlap, not embeddings
+
 
 ## The Stack (Strictly Open)
 

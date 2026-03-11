@@ -42,43 +42,147 @@ _STOPWORDS = {
 def _infinigram_count(query: str) -> int:
     """Return how many times a phrase appears in Dolma."""
     import requests
+    payload = {"index": INFINIGRAM_INDEX, "query_type": "count", "query": query}
+    print(f"[infini-gram COUNT] query={query!r} → POST {INFINIGRAM_API}", flush=True)
     try:
-        r = requests.post(
-            INFINIGRAM_API,
-            json={"index": INFINIGRAM_INDEX, "query_type": "count", "query": query},
-            timeout=10,
-        )
+        r = requests.post(INFINIGRAM_API, json=payload, timeout=10)
+        raw = r.text
+        print(f"[infini-gram COUNT] status={r.status_code} response={raw[:300]}", flush=True)
         d = r.json()
-        return d.get("count", d.get("cnt", 0))
-    except Exception:
+        count = d.get("count", d.get("cnt", 0))
+        print(f"[infini-gram COUNT] parsed count={count}", flush=True)
+        return count
+    except Exception as exc:
+        print(f"[infini-gram COUNT] EXCEPTION: {exc}", flush=True)
         return 0
 
 
 def _infinigram_docs(query: str, n: int = 3) -> tuple[int, list[dict]]:
     """Return (total_count, list of doc snippets) for a phrase."""
     import requests
+    payload = {"index": INFINIGRAM_INDEX, "query_type": "search_docs", "query": query, "maxnum": n}
+    print(f"[infini-gram DOCS] query={query!r} → POST {INFINIGRAM_API}", flush=True)
     try:
-        r = requests.post(
-            INFINIGRAM_API,
-            json={"index": INFINIGRAM_INDEX, "query_type": "search_docs", "query": query, "maxnum": n},
-            timeout=15,
-        )
+        r = requests.post(INFINIGRAM_API, json=payload, timeout=15)
+        raw = r.text
+        print(f"[infini-gram DOCS] status={r.status_code} response_len={len(raw)} preview={raw[:500]}", flush=True)
         d = r.json()
+        count = d.get("cnt", d.get("count", 0))
+        print(f"[infini-gram DOCS] parsed count={count} num_docs={len(d.get('documents', []))}", flush=True)
         docs = []
         for doc in d.get("documents", []):
             spans = doc.get("spans", [])
-            text = "".join(s[0] for s in spans if s[0])
+            # spans is a list of [text_segment, is_match_bool] pairs
+            text = "".join(s[0] for s in spans if isinstance(s, (list, tuple)) and s)
             try:
                 meta = json.loads(doc.get("metadata", "{}"))
             except Exception:
                 meta = {}
             inner = meta.get("metadata", {})
-            subreddit = inner.get("metadata", {}).get("subreddit", "")
-            source = f"reddit /r/{subreddit}" if subreddit else inner.get("source", "unknown")
-            docs.append({"text": text[:400], "source": source, "url": inner.get("url", "")})
-        return d.get("cnt", 0), docs
-    except Exception:
+            url = inner.get("url", "") or inner.get("metadata", {}).get("url", "")
+                # Keep up to 800 chars so nearby license comments aren't cut off
+            docs.append({"text": text[:800], "source": "Dolma training data", "url": url})
+        return count, docs
+    except Exception as exc:
+        print(f"[infini-gram DOCS] EXCEPTION: {exc}", flush=True)
         return 0, []
+
+
+def debug_single_query(query: str) -> dict:
+    """
+    Run a single query against infini-gram and return everything:
+    - The exact request sent
+    - The raw HTTP status and response body
+    - Parsed count
+    - Sample documents with their raw spans
+    - Any error
+    Also tries progressively shorter sub-phrases (4..6-word windows)
+    so you can see which parts have signal.
+    """
+    import requests
+
+    result = {
+        "query": query,
+        "api_url": INFINIGRAM_API,
+        "index": INFINIGRAM_INDEX,
+        "count_request": None,
+        "count_response_status": None,
+        "count_response_raw": None,
+        "count_parsed": None,
+        "docs_request": None,
+        "docs_response_status": None,
+        "docs_response_raw": None,
+        "docs_parsed_count": None,
+        "docs_parsed_documents": None,
+        "sub_phrase_counts": [],
+        "error": None,
+    }
+
+    # ── 1. COUNT ──────────────────────────────────────────────────────────
+    count_payload = {"index": INFINIGRAM_INDEX, "query_type": "count", "query": query}
+    result["count_request"] = count_payload
+    try:
+        r = requests.post(INFINIGRAM_API, json=count_payload, timeout=15)
+        result["count_response_status"] = r.status_code
+        result["count_response_raw"] = r.text[:2000]
+        d = r.json()
+        result["count_parsed"] = d.get("count", d.get("cnt", d))
+    except Exception as exc:
+        result["error"] = f"COUNT call failed: {exc}"
+        return result
+
+    # ── 2. SEARCH_DOCS ────────────────────────────────────────────────────
+    docs_payload = {"index": INFINIGRAM_INDEX, "query_type": "search_docs", "query": query, "maxnum": 3}
+    result["docs_request"] = docs_payload
+    try:
+        r = requests.post(INFINIGRAM_API, json=docs_payload, timeout=20)
+        result["docs_response_status"] = r.status_code
+        result["docs_response_raw"] = r.text[:4000]
+        d = r.json()
+        result["docs_parsed_count"] = d.get("cnt", d.get("count", 0))
+        result["docs_parsed_documents"] = [
+            {
+                "spans": doc.get("spans", [])[:5],  # first 5 span entries
+                "full_text_preview": "".join(
+                    s[0] for s in doc.get("spans", [])
+                    if isinstance(s, (list, tuple)) and s
+                )[:500],
+                "metadata_raw": doc.get("metadata", "")[:300],
+            }
+            for doc in d.get("documents", [])
+        ]
+    except Exception as exc:
+        result["error"] = f"DOCS call failed: {exc}"
+        return result
+
+    # ── 3. SUB-PHRASE COUNTS (4-6 word windows) ───────────────────────────
+    words = query.split()
+    sub_phrases_to_try = set()
+    for window in (4, 5, 6):
+        for i in range(len(words) - window + 1):
+            sub_phrases_to_try.add(" ".join(words[i:i + window]))
+    # Also try individual words longer than 5 chars
+    for w in words:
+        if len(w) > 5:
+            sub_phrases_to_try.add(w)
+
+    for sp in sorted(sub_phrases_to_try):
+        if sp == query:
+            continue
+        try:
+            sr = requests.post(
+                INFINIGRAM_API,
+                json={"index": INFINIGRAM_INDEX, "query_type": "count", "query": sp},
+                timeout=10,
+            )
+            sd = sr.json()
+            cnt = sd.get("count", sd.get("cnt", 0))
+            result["sub_phrase_counts"].append({"phrase": sp, "count": cnt, "raw": sr.text[:200]})
+        except Exception as exc:
+            result["sub_phrase_counts"].append({"phrase": sp, "count": -1, "error": str(exc)})
+
+    result["sub_phrase_counts"].sort(key=lambda x: -(x.get("count") or 0))
+    return result
 
 
 def _key_subphrases(text: str) -> list[str]:
@@ -181,6 +285,601 @@ def search_dolma_local(query: str, dolma_path: Optional[str] = None) -> list[dic
             continue
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# 1b. SNIPPET PROVENANCE — Phrase extraction, Dolma search, license detection
+# ---------------------------------------------------------------------------
+
+_LICENSE_PATTERNS = [
+    (r'\bMIT\b(?:\s+License)?', 'MIT'),
+    (r'\bApache(?:-2\.0)?\b', 'Apache'),
+    (r'\bGPL\b|\bGNU\s+General\s+Public\s+License\b', 'GPL'),
+    (r'\bBSD\b(?:\s+License)?', 'BSD'),
+    (r'permission\s+is\s+hereby\s+granted', 'MIT (permission grant)'),
+    (r'\ball\s+rights\s+reserved\b', 'All Rights Reserved'),
+    (r'\bpublic\s+domain\b', 'Public Domain'),
+    (r'\bCC\s*BY\b', 'Creative Commons'),
+    (r'\bISC\b(?:\s+License)?', 'ISC'),
+    (r'\bMPL\b', 'Mozilla Public License'),
+    (r'SPDX-License-Identifier\s*:', 'SPDX-License-Identifier'),
+    (r'[Cc]opyright\s+(?:\(c\)|©|\(C\))', 'Copyright'),
+    (r'[Ll]icensed\s+under\s+the', 'Licensed under'),
+]
+
+
+def _detect_licenses(text: str) -> list[str]:
+    """Return a deduplicated list of license names found in a block of text."""
+    found: list[str] = []
+    for pattern, label in _LICENSE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE) and label not in found:
+            found.append(label)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# License compatibility matrix
+# "green"  — same or clearly compatible family
+# "yellow" — possibly compatible but worth checking (e.g. permissive vs copyleft)
+# "red"    — known incompatibility / proprietary restriction
+# "white"  — no match / can't determine
+# ---------------------------------------------------------------------------
+
+# Canonical family groupings (lower-case keys)
+_PERMISSIVE  = {"mit", "apache", "bsd", "isc", "public domain", "creative commons", "unlicensed"}
+_COPYLEFT    = {"gpl", "agpl", "lgpl", "mpl"}
+_RESTRICTIVE = {"all rights reserved", "proprietary"}
+
+# Normalized label → canonical family
+def _lic_family(name: str) -> str:
+    n = name.lower()
+    if any(k in n for k in ("mit", "permission grant")):
+        return "mit"
+    if "apache" in n:
+        return "apache"
+    if "agpl" in n or "affero" in n:
+        return "agpl"
+    if "lgpl" in n or "lesser" in n:
+        return "lgpl"
+    if any(k in n for k in ("gpl", "gnu general")):
+        return "gpl"
+    if "mpl" in n or "mozilla" in n:
+        return "mpl"
+    if "bsd" in n:
+        return "bsd"
+    if "isc" in n:
+        return "isc"
+    if "all rights reserved" in n:
+        return "all rights reserved"
+    if "proprietary" in n:
+        return "proprietary"
+    if "public domain" in n or "unlicensed" in n:
+        return "unlicensed"
+    if "creative commons" in n or "cc by" in n:
+        return "creative commons"
+    return n.strip()
+
+
+def assess_license_compatibility(
+    user_license: str,
+    detected_licenses: list[str],
+) -> dict:
+    """
+    Compare the user's declared snippet license against licenses found in
+    Dolma source documents.
+
+    Returns:
+        {
+          "flag": "green" | "yellow" | "red" | "white",
+          "explanation": str,          # one-line human summary
+          "user_license": str,
+          "detected": list[str],       # deduplicated across all phrases
+        }
+    """
+    user = user_license.strip() if user_license else ""
+    if not detected_licenses:
+        if not user:
+            return {"flag": "white", "explanation": "No license information found in Dolma source documents.", "user_license": user, "detected": []}
+        return {"flag": "white", "explanation": "No license strings detected in the matching Dolma documents — compatibility cannot be determined.", "user_license": user, "detected": []}
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    unique_detected: list[str] = []
+    for lic in detected_licenses:
+        if lic not in seen:
+            seen.add(lic)
+            unique_detected.append(lic)
+
+    if not user:
+        names = ", ".join(f"`{l}`" for l in unique_detected)
+        return {
+            "flag": "white",
+            "explanation": f"Licenses detected in training sources ({names}), but you haven't selected your project's license — select one from the dropdown to get a compatibility flag.",
+            "user_license": "",
+            "detected": unique_detected,
+        }
+
+    uf = _lic_family(user)
+    detected_families = [_lic_family(d) for d in unique_detected]
+
+    # All-rights-reserved in source → red regardless of user license
+    if "all rights reserved" in detected_families:
+        return {
+            "flag": "red",
+            "explanation": (
+                f"⛔ A source document contains **All Rights Reserved** — "
+                f"this phrasing in Dolma may originate from proprietary code that conflicts with your `{user}` license."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Permissive user + copyleft source → 🔴 (copyleft is viral; GPL taints permissive code)
+    if uf in _PERMISSIVE and any(f in _COPYLEFT for f in detected_families):
+        conflicting = [d for d, f in zip(unique_detected, detected_families) if f in _COPYLEFT]
+        return {
+            "flag": "red",
+            "explanation": (
+                f"⛔ Permissive/copyleft conflict — source document(s) carry copyleft license(s) "
+                f"({', '.join(conflicting)}) which cannot be combined with your permissive `{user}` "
+                f"license without adopting the copyleft terms."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Copyleft user + permissive source → 🟢 (copyleft can incorporate permissive code)
+    if uf in _COPYLEFT and all(f in _PERMISSIVE for f in detected_families):
+        return {
+            "flag": "green",
+            "explanation": (
+                f"✅ Source licenses ({', '.join(unique_detected)}) are permissive — "
+                f"compatible with your copyleft `{user}` license."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Exact same family → 🟢
+    if uf in detected_families:
+        return {
+            "flag": "green",
+            "explanation": (
+                f"✅ Detected license(s) in source documents ({', '.join(unique_detected)}) "
+                f"match your declared `{user}` license — compatible."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Both permissive but different (e.g. MIT declared, Apache detected) → 🟡
+    # Lower severity than a copyleft conflict; worth noting but not a blocker.
+    if uf in _PERMISSIVE and all(f in _PERMISSIVE for f in detected_families):
+        names = ", ".join(unique_detected)
+        return {
+            "flag": "yellow",
+            "explanation": (
+                f"⚠️ Permissive/permissive mismatch — source uses ({names}), "
+                f"you declared `{user}`. Both are permissive but check attribution "
+                f"requirements differ (e.g. Apache-2.0 requires NOTICE file)."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Both copyleft but different versions/flavours → 🟡
+    if uf in _COPYLEFT and all(f in _COPYLEFT for f in detected_families):
+        names = ", ".join(unique_detected)
+        return {
+            "flag": "yellow",
+            "explanation": (
+                f"⚠️ Copyleft/copyleft mismatch — source uses ({names}), "
+                f"you declared `{user}`. Combining different copyleft licenses "
+                f"may require legal review."
+            ),
+            "user_license": user,
+            "detected": unique_detected,
+        }
+
+    # Mixed or unknown → yellow
+    names = ", ".join(unique_detected)
+    return {
+        "flag": "yellow",
+        "explanation": (
+            f"⚠️ Source document license(s) ({names}) differ from your declared `{user}` license — "
+            f"review compatibility before redistributing."
+        ),
+        "user_license": user,
+        "detected": unique_detected,
+    }
+
+
+def build_dolma_issue_body(
+    snippet: str,
+    user_license: str,
+    assessment: dict,
+    provenance: dict,
+) -> tuple[str, str]:
+    """
+    Build a pre-filled GitHub issue body for allenai/dolma reporting a
+    potential license concern.
+
+    Returns (issue_markdown_preview, github_new_issue_url).
+    """
+    import urllib.parse
+
+    flag = assessment.get("flag", "white")
+    explanation = assessment.get("explanation", "")
+    detected = assessment.get("detected", [])
+
+    # Collect phrase hit details
+    phrase_rows: list[str] = []
+    sample_passages: list[str] = []
+    for item in provenance.get("phrases", []):
+        if item["count"] > 0:
+            phrase_rows.append(
+                f'| `{item["phrase"][:80]}` | {item["count"]:,} | {", ".join(item["licenses"]) or "none detected"} |'
+            )
+            for i, doc in enumerate(item["docs"][:2], 1):
+                preview = doc["text"][:300].replace("\n", " ")
+                url_line = f"\n  Source: {doc['url']}" if doc.get("url") else ""
+                sample_passages.append(f"**Passage {i} for phrase `{item['phrase'][:60]}`:**\n```\n{preview}\n```{url_line}")
+
+    severity_label = {"green": "info", "yellow": "potential concern", "red": "license conflict"}.get(flag, "unknown")
+
+    body_lines = [
+        f"## License Concern Report — {severity_label.title()}",
+        "",
+        f"**Reported by:** View Source AI (snippet provenance tool)",
+        f"**Flag:** {flag.upper()} — {explanation}",
+        f"**User-declared license:** `{user_license or 'not specified'}`",
+        f"**Detected license(s) in Dolma sources:** {', '.join(detected) if detected else 'none'}",
+        "",
+        "### Snippet",
+        f"```\n{snippet[:1000]}\n```",
+        "",
+    ]
+
+    if phrase_rows:
+        body_lines += [
+            "### Phrase Match Summary",
+            "",
+            "| Phrase | Dolma count | Licenses in source |",
+            "|--------|-------------|-------------------|",
+            *phrase_rows,
+            "",
+        ]
+
+    if sample_passages:
+        body_lines += ["### Sample Source Passages", ""]
+        body_lines += sample_passages
+        body_lines.append("")
+
+    body_lines += [
+        "---",
+        "*Drafted via [View Source AI](https://github.com/allenai/dolma) — "
+        "a tool for auditing training data provenance.*",
+    ]
+
+    full_body = "\n".join(body_lines)
+    title = f"[License] {severity_label.title()}: {', '.join(detected[:2]) or 'unknown'} in training source"
+
+    params = urllib.parse.urlencode({"title": title, "body": full_body, "labels": "data-quality"})
+    github_url = f"https://github.com/allenai/dolma/issues/new?{params}"
+
+    preview_md = f"""### 📋 Issue Preview — allenai/dolma
+
+**Severity:** {flag.upper()} — {severity_label}
+**Title:** {title}
+
+---
+
+{full_body}
+
+---
+
+### 🚀 Submit
+
+[Open this issue on GitHub (pre-filled)]({github_url})
+"""
+    return preview_md, github_url
+
+
+def extract_snippet_phrases(snippet: str, n: int = 5) -> list[str]:
+    """
+    Extract 3–5 distinctive phrases from a code snippet for Dolma searching.
+
+    Priority (highest first):
+      1. License / copyright / permission lines
+      2. Comment lines (# // /* *)
+      3. Error / exception / raise lines
+      4. Function / class signatures with specific names
+      5. Lines with quoted strings (>= 10 chars inside quotes)
+      6. Other long lines
+
+    Skips blank lines and pure import statements.
+    Each returned phrase is capped at 100 characters.
+    """
+    scored: list[tuple[float, int, str]] = []
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip pure import lines
+        if re.match(r'^(?:import\s+\S|from\s+\S+\s+import)\b', stripped):
+            continue
+        # Skip very short lines (lone brackets, keywords, etc.)
+        if len(stripped) < 15:
+            continue
+
+        score = 0.0
+        if re.search(
+            r'SPDX-License-Identifier|permission\s+is\s+hereby|copyright|\ball\s+rights\s+reserved\b|licensed\s+under',
+            stripped, re.IGNORECASE
+        ):
+            score += 10
+        if re.match(r'#|//|\*+\s|/\*', stripped):
+            score += 4
+        if re.search(r'\b(raise|error|exception|warn|assert|fail)\b', stripped, re.IGNORECASE):
+            score += 3
+        if re.match(r'(?:def |class |function |public |private |static |async\s+def |fn )\w', stripped):
+            score += 3
+        if re.search(r'["\'](?:[^"\']{10,})["\']', stripped):
+            score += 2
+        score += min(len(stripped) / 25.0, 4.0)
+
+        scored.append((score, len(stripped), stripped))
+
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for _, _, line in scored:
+        phrase = (line[:100].rsplit(' ', 1)[0] if len(line) > 100 else line).rstrip(',;:').strip()
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            result.append(phrase)
+        if len(result) >= n:
+            break
+    return result
+
+
+def _joined_snippet_phrase(snippet: str, max_len: int = 180) -> str:
+    """
+    Return the first `max_len` characters of the snippet with lines joined by
+    a single space and leading whitespace stripped from each line.
+
+    This normalises indented, multi-line code into the single-line form that
+    often appears in minified JS/CSS bundles stored in Dolma.  Those bundles
+    usually include the license comment on the very same line (or just before),
+    so matching this joined form is the most reliable way to find the license.
+    """
+    parts = []
+    for line in snippet.splitlines():
+        s = line.strip()
+        if s:
+            parts.append(s)
+    joined = " ".join(parts)
+    return joined[:max_len]
+
+
+def search_snippet_provenance(snippet: str, bank=None) -> dict:
+    """
+    Full pipeline for a code snippet:
+      1. Build a "whole-snippet" probe (lines joined, first 180 chars) and search it
+      2. Extract 3–5 distinctive individual phrases and search each
+      3. For phrases with count > 0, fetch sample documents
+      4. Detect license strings in those documents
+      5. Supplement with bank-derived license when no Dolma license found
+      6. Cross-reference against known pattern bank (optional)
+
+    Returns:
+        {
+          "phrases": [{"phrase", "count", "docs", "licenses", "bank_match"}, ...],
+          "all_detected_licenses": [str, ...],
+        }
+    """
+    # Build phrase list: whole-snippet probe first, then individual extracted lines
+    joined_probe = _joined_snippet_phrase(snippet)
+    extracted = extract_snippet_phrases(snippet, n=5)
+
+    # Deduplicate: if the joined probe is nearly identical to the first extracted
+    # phrase (i.e. the snippet is already a single line), skip it to save an API call.
+    phrases: list[str] = []
+    seen_ph: set[str] = set()
+    for p in ([joined_probe] if len(joined_probe) >= 20 else []) + extracted:
+        if p not in seen_ph:
+            seen_ph.add(p)
+            phrases.append(p)
+
+    results = []
+    all_licenses_seen: set[str] = set()
+    all_licenses: list[str] = []
+    for phrase in phrases:
+        count, docs = _infinigram_docs(phrase, n=3)
+        licenses: list[str] = []
+        seen_lic: set[str] = set()
+        for doc in docs:
+            for lic in _detect_licenses(doc["text"]):
+                if lic not in seen_lic:
+                    seen_lic.add(lic)
+                    licenses.append(lic)
+                if lic not in all_licenses_seen:
+                    all_licenses_seen.add(lic)
+                    all_licenses.append(lic)
+
+        # Bank lookup — find best matching known pattern
+        bank_match = None
+        if bank is not None:
+            relevant = bank.find_relevant(phrase)
+            if relevant:
+                bank_match = relevant[0]
+
+        # Supplement: if Dolma documents didn’t include a license string but
+        # the bank says this is a known library with a known license, use it.
+        # This handles the common case where the license header is at the top
+        # of the source file, far from the matched code line.
+        if not licenses and bank_match:
+            bank_lic = bank_match.get("labels", {}).get("license", "")
+            if bank_lic and bank_lic not in seen_lic:
+                note = f"{bank_lic} (from pattern bank)"
+                licenses.append(note)
+                seen_lic.add(note)
+                if note not in all_licenses_seen:
+                    all_licenses_seen.add(note)
+                    all_licenses.append(note)
+
+        is_joined = (phrase == joined_probe)
+        # Only emit the joined probe when it actually hits — a 0-count joined
+        # probe just duplicates info already covered by the individual phrases.
+        if is_joined and count == 0:
+            continue
+
+        results.append({"phrase": phrase, "count": count, "docs": docs,
+                        "licenses": licenses, "bank_match": bank_match})
+    return {"phrases": results, "all_detected_licenses": all_licenses}
+
+
+def _phrase_flag(count: int, phrase_licenses: list[str], user_license: str) -> tuple[str, str]:
+    """
+    Return (flag_key, icon + one-line explanation) for a single Dolma search result.
+
+    🟢  Found, source license matches (or is compatible with) user's declared license.
+    🟡  Found, no license detected in source OR no user license declared.
+    🔴  Found, source license conflicts with user's declared license.
+    ⚪  Not found in training data.
+    """
+    if count == 0:
+        return "white", "⚪ Not found in Dolma training data"
+
+    if not phrase_licenses:
+        if user_license and user_license.lower() not in ("", "i don't know"):
+            return "yellow", (
+                f"🟡 Found **{count:,}** hit(s) — no license detected in source documents, "
+                f"cannot verify `{user_license}` compatibility"
+            )
+        return "yellow", f"🟡 Found **{count:,}** hit(s) — no license detected in source documents"
+
+    lic_names = ", ".join(f"`{l}`" for l in phrase_licenses[:3])
+    ul = (user_license or "").strip()
+    if not ul or ul.lower() == "i don't know":
+        return "yellow", f"🟡 Found **{count:,}** hit(s) — detected license(s) {lic_names} in source (select your project\'s license to compare)"
+
+    assessment = assess_license_compatibility(ul, phrase_licenses)
+    flag = assessment["flag"]
+    flag_icons = {"green": "🟢", "yellow": "🟡", "red": "🔴", "white": "⚪"}
+    icon = flag_icons.get(flag, "🟡")
+    expl = re.sub(r'^[✅⛔⚠️\s]+', '', assessment["explanation"]).strip()
+    # A "white" from assess means no data — treat as yellow in context of hits
+    effective_flag = flag if flag != "white" else "yellow"
+    return effective_flag, f"{icon} Found **{count:,}** hit(s) — {expl}"
+
+
+def format_snippet_provenance_markdown(provenance: dict, user_license: str = "") -> str:
+    """Render per-phrase provenance results with per-line flag icons."""
+    phrases = provenance.get("phrases", [])
+    if not phrases:
+        return "*No distinctive phrases could be extracted from this snippet.*"
+
+    # ── Overall license flag banner ────────────────────────────────────────
+    assessment = assess_license_compatibility(
+        user_license, provenance.get("all_detected_licenses", [])
+    )
+    flag_icons = {"green": "🟢", "yellow": "🟡", "red": "🔴", "white": "⚪"}
+    overall_icon = flag_icons.get(assessment["flag"], "⚪")
+
+    lines = ["## 🔍 Snippet Provenance — Dolma Search Results\n"]
+    lines.append(
+        "*Distinctive lines extracted from your snippet, searched against the "
+        "[Dolma v1.7 training corpus](https://huggingface.co/datasets/allenai/dolma) "
+        "— OLMo's 3-trillion-token training dataset. "
+        "Counts are exact-phrase occurrences in the full corpus.*\n"
+    )
+    lines.append(
+        "> 💡 **How to read these results:** Counts reflect how many times an exact phrase "
+        "appears across Dolma after deduplication. A low count doesn't mean the code is rare "
+        "— Dolma collapses near-duplicate documents, so a widely-used library may appear only "
+        "a handful of times. The license flag compares the source license found in those "
+        "documents against your project's declared license.\n"
+    )
+    lines.append(f"### {overall_icon} Overall: {assessment['explanation']}\n")
+    lines.append("---\n")
+
+    for item in phrases:
+        phrase     = item["phrase"]
+        count      = item["count"]
+        docs       = item["docs"]
+        licenses   = item["licenses"]
+        bank_match = item.get("bank_match")
+
+        flag_key, flag_line = _phrase_flag(count, licenses, user_license)
+
+        display_phrase = phrase[:80] + ("…" if len(phrase) > 80 else "")
+        lines.append(f"### `{display_phrase}`")
+        lines.append(f"{flag_line}\n")
+
+        # Bank annotation — known library / license
+        if bank_match:
+            bm_labels = bank_match.get("labels", {})
+            bm_lib    = bm_labels.get("library", bank_match.get("source", "?"))
+            bm_lic    = bm_labels.get("license", "?")
+            bm_notes  = bank_match.get("notes", "")
+            lines.append(
+                f"> 📖 **Pattern bank match** — `{bm_lib}` is {bm_lic} licensed"
+                + (f" ({bm_notes})" if bm_notes else "")
+                + "\n> *(License identified from local pattern bank, not from the Dolma document text)*"
+            )
+            lines.append("")
+
+        if count > 0:
+            lines.append(f"**Dolma count:** {count:,}")
+            if count < 100:
+                lines.append(
+                    "*Low count — Dolma aggressively deduplicates, so even widely-used code "
+                    "may appear only a few times. This reflects unique document copies, not "
+                    "real-world usage frequency.*"
+                )
+            elif count > 100_000:
+                lines.append(
+                    "*High count — this phrase appears broadly across Dolma. "
+                    "The matched documents likely include tutorials, Stack Overflow mirrors, "
+                    "blog posts, and source code copies.*"
+                )
+            if licenses:
+                lic_badges = "  ".join(f"`{l}`" for l in licenses)
+                lines.append(f"**Licenses in source docs:** {lic_badges}")
+
+            if docs:
+                lines.append("\n**Sample passages from Dolma:**\n")
+                for i, doc in enumerate(docs, 1):
+                    preview = doc["text"][:350].replace("\n", " ")
+                    if len(doc["text"]) > 350:
+                        preview += "…"
+                    lines.append(f"**{i}.** *(Dolma training data)*")
+                    lines.append(f"> {preview}")
+                    if doc.get("url"):
+                        lines.append(f"[Original source]({doc['url']})")
+                    lines.append("")
+        else:
+            lines.append("*This phrase was not found verbatim in Dolma.*")
+            lines.append(
+                "*This can happen for a few reasons: Dolma deduplication collapsed all "
+                "copies into one document whose exact wording differs slightly; the code "
+                "is from a minified or bundled form not present in source; or the snippet "
+                "is original and genuinely absent from the training data.*"
+            )
+
+        lines.append("\n---\n")
+
+    any_hits = any(item["count"] > 0 for item in phrases)
+    if not any_hits:
+        lines.append(
+            "> ⚪ **No phrases found in Dolma.** "
+            "This snippet likely does not appear verbatim in OLMo's training data.\n"
+            "> Search manually: [infini-gram explorer](https://huggingface.co/spaces/liujch1998/infini-gram)\n"
+        )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -392,13 +1091,9 @@ def build_provenance_chart(provenance_reports: list[dict]):
         ec = m.get("exact_count", 0)
         if ep and ec:
             all_sub_counts[ep] = ec
-        # Source distribution from sample docs
+        # Source distribution — all results are from Dolma
         for doc in m.get("exact_docs", []):
-            src = doc.get("source", "unknown")
-            # Normalise — collapse subreddit detail to top-level source
-            if src.startswith("reddit"):
-                src = "reddit"
-            source_counter[src] += 1
+            source_counter["Dolma"] += 1
 
     if not all_sub_counts:
         return None
@@ -409,12 +1104,12 @@ def build_provenance_chart(provenance_reports: list[dict]):
     counts  = [c for _, c in sorted_phrases]
 
     fig, axes = plt.subplots(
-        1, 2 if source_counter else 1,
-        figsize=(11, max(3, len(phrases) * 0.55 + 1.5)),
+        1, 1,
+        figsize=(9, max(3, len(phrases) * 0.55 + 1.5)),
         facecolor="#0f0f0f",
     )
-    ax_bar = axes[0] if source_counter else axes
-    ax_pie = axes[1] if source_counter else None
+    ax_bar = axes
+    ax_pie = None
 
     # ── Left: horizontal bar chart ──────────────────────────────────────────
     colors = ["#4a90d9" if c < 10_000 else "#e8734a" if c < 1_000_000 else "#d94a4a"
@@ -617,34 +1312,64 @@ class ExampleBank:
 
 SEED_EXAMPLES = [
     {
-        "text": "This is terrible code. Did you even test this? I can't believe this was merged.",
-        "labels": {"toxicity": "hostile", "constructiveness": "unconstructive"},
+        "text": "Permission is hereby granted, free of charge, to any person obtaining a copy",
+        "labels": {"provenance": "known-mit", "library": "generic", "license": "MIT"},
         "source": "seed",
-        "notes": "Hostile tone with no actionable feedback.",
+        "notes": "Standard MIT license header — appears in hundreds of thousands of open-source projects.",
     },
     {
-        "text": "I think there's a bug on line 42 — the null check should happen before the array access. Here's a fix: ...",
-        "labels": {"toxicity": "respectful", "constructiveness": "constructive"},
+        "text": 'Licensed under the Apache License, Version 2.0 (the "License")',
+        "labels": {"provenance": "known-apache", "library": "generic", "license": "Apache-2.0"},
         "source": "seed",
-        "notes": "Identifies specific issue with proposed solution.",
+        "notes": "Apache 2.0 license header — common in Apache Software Foundation and Google open-source projects.",
     },
     {
-        "text": "This approach won't scale. Have you considered using a hashmap instead? See O(n) vs O(1) lookup discussion here: ...",
-        "labels": {"toxicity": "neutral", "constructiveness": "constructive"},
+        "text": "GNU General Public License as published by the Free Software Foundation",
+        "labels": {"provenance": "known-gpl", "library": "generic", "license": "GPL-3.0"},
         "source": "seed",
-        "notes": "Direct but professional criticism with alternative.",
+        "notes": "GPL copyleft header — any derivative work must also be GPL. Strong viral license.",
     },
     {
-        "text": "Why do we even have this feature? Nobody asked for it. Complete waste of everyone's time.",
-        "labels": {"toxicity": "dismissive", "constructiveness": "unconstructive"},
+        "text": "Redistribution and use in source and binary forms, with or without modification",
+        "labels": {"provenance": "known-bsd", "library": "generic", "license": "BSD-2-Clause"},
         "source": "seed",
-        "notes": "Dismissive without offering alternatives or context.",
+        "notes": "BSD license redistribution clause — permissive, requires copyright notice in redistribution.",
     },
     {
-        "text": "+1, works for me. Thanks for the fix!",
-        "labels": {"toxicity": "respectful", "constructiveness": "mixed"},
+        "text": "function createElement(type, config, children) {",
+        "labels": {"provenance": "known-pattern", "library": "react", "license": "MIT"},
         "source": "seed",
-        "notes": "Positive but minimal actionable content.",
+        "notes": "React core createElement function signature. React is MIT licensed (facebook/react).",
+    },
+    {
+        "text": "exports._ = exports.lodash = lodash;",
+        "labels": {"provenance": "known-pattern", "library": "lodash", "license": "MIT"},
+        "source": "seed",
+        "notes": "Lodash module export pattern. Lodash is MIT licensed (lodash/lodash).",
+    },
+    {
+        "text": "def wsgi_app(self, environ, start_response):",
+        "labels": {"provenance": "known-pattern", "library": "flask", "license": "BSD-3-Clause"},
+        "source": "seed",
+        "notes": "Flask WSGI application method signature. Flask is BSD-3-Clause licensed (pallets/flask).",
+    },
+    {
+        "text": "Copyright (c) Facebook, Inc. and its affiliates.",
+        "labels": {"provenance": "corporate-copyright", "library": "react", "license": "MIT"},
+        "source": "seed",
+        "notes": "Meta/Facebook copyright header. Used in React, Jest, and other Meta OSS projects (all MIT).",
+    },
+    {
+        "text": "Copyright 2010-2023 JetBrains s.r.o. and Kotlin Programming Language contributors",
+        "labels": {"provenance": "corporate-copyright", "library": "kotlin", "license": "Apache-2.0"},
+        "source": "seed",
+        "notes": "JetBrains/Kotlin copyright header. Apache-2.0 licensed.",
+    },
+    {
+        "text": "var React = require('react');",
+        "labels": {"provenance": "known-pattern", "library": "react", "license": "MIT"},
+        "source": "seed",
+        "notes": "Classic React CommonJS require pattern — pre-hooks React codebases.",
     },
 ]
 
