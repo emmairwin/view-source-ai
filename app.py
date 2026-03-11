@@ -1,12 +1,17 @@
 """
-GitHub Comment Sentiment Agent
-==============================
-Uses OLMo 2 1B Instruct (Allen AI) — a fully open-source LLM
-trained on the Dolma dataset (open, documented training data).
+Fossil Record
+=============
+Code leaves fossils. This reads them.
 
-License: Apache 2.0
-Model: https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct
+Paste a code snippet and see:
+- Which lines appear verbatim in Dolma (OLMo's 3-trillion-token training corpus)
+- How many times each line appears
+- What licenses the matched source documents carry
+- Whether those licenses are compatible with your project's license
+
 Training Data: https://huggingface.co/datasets/allenai/dolma
+infini-gram API: https://api.infini-gram.io
+License: Apache 2.0
 """
 
 import json
@@ -14,24 +19,20 @@ import os
 import re
 import gradio as gr
 import requests
-from dataclasses import dataclass, field
 from typing import Optional
-
-# Pre-import transformers pipeline at module level — avoids thread-safety issues
-# with lazy imports in transformers 5.x when called from Gradio worker threads.
-try:
-    from transformers import pipeline as _hf_pipeline_fn
-except ImportError:
-    _hf_pipeline_fn = None
 
 from data_provenance import (
     ExampleBank,
     build_provenance_chart,
-    build_provenance_report,
-    format_provenance_markdown,
     initialize_example_bank,
-    search_dolma_wimbd,
-    search_dolma_local,
+    search_snippet_provenance,
+    format_snippet_provenance_markdown,
+    assess_license_compatibility,
+    build_dolma_issue_body,
+    extract_snippet_phrases,
+    debug_single_query,
+    INFINIGRAM_API,
+    INFINIGRAM_INDEX,
 )
 
 
@@ -40,39 +41,25 @@ from data_provenance import (
 # ---------------------------------------------------------------------------
 
 UPSTREAM_TARGETS = {
-    "model_behavior": {
-        "name": "Model Behavior (Misclassification / Bias)",
-        "repo": "allenai/OLMo",
-        "description": "The model consistently misclassifies a type of comment",
-        "new_issue_url": "https://github.com/allenai/OLMo/issues/new",
-        "email": "olmo@allenai.org",
-    },
     "training_data": {
-        "name": "Training Data (Dolma)",
+        "name": "Training Data Quality (Dolma)",
         "repo": "allenai/dolma",
-        "description": "Problematic or missing data in the training corpus",
+        "description": "Report problematic, incorrectly licensed, or missing data in the Dolma corpus",
         "new_issue_url": "https://github.com/allenai/dolma/issues/new",
         "email": "olmo@allenai.org",
     },
-    "post_training": {
-        "name": "Post-Training / Instruction Tuning (Open Instruct / Tülu)",
-        "repo": "allenai/open-instruct",
-        "description": "Improve instruction-following or classification via better training examples",
-        "new_issue_url": "https://github.com/allenai/open-instruct/issues/new",
+    "model_behavior": {
+        "name": "Model Behavior (OLMo)",
+        "repo": "allenai/OLMo",
+        "description": "Report unexpected model outputs that may trace back to problematic training data",
+        "new_issue_url": "https://github.com/allenai/OLMo/issues/new",
         "email": "olmo@allenai.org",
     },
     "olmotrace": {
         "name": "OLMoTrace (Data Tracing Tool)",
         "repo": "allenai/OLMoTrace",
-        "description": "Feedback on the training data tracing/attribution system",
+        "description": "Feedback on the training data tracing and attribution system",
         "new_issue_url": "https://github.com/allenai/OLMoTrace/issues/new",
-        "email": "olmo@allenai.org",
-    },
-    "training_framework": {
-        "name": "Training Framework (OLMo-core)",
-        "repo": "allenai/OLMo-core",
-        "description": "Training code, recipes, architecture suggestions",
-        "new_issue_url": "https://github.com/allenai/OLMo-core/issues/new",
         "email": "olmo@allenai.org",
     },
 }
@@ -83,80 +70,71 @@ def generate_issue_body(
     issue_type: str,
     title: str,
     description: str,
-    example_comment: str,
-    expected_label: str,
-    actual_label: str,
+    snippet: str,
+    detected_license: str,
+    declared_license: str,
     evidence_notes: str,
 ) -> tuple[str, str, str]:
     """
     Generate a well-formatted GitHub issue body for upstream contribution.
     Returns (formatted_issue_markdown, github_url_with_prefill, raw_text).
     """
-    target = UPSTREAM_TARGETS.get(target_key, UPSTREAM_TARGETS["model_behavior"])
-
-    # Build the issue body
+    target = UPSTREAM_TARGETS.get(target_key, UPSTREAM_TARGETS["training_data"])
     body_parts = []
 
-    if issue_type == "Misclassification Report":
-        body_parts.append(f"## Misclassification Report\n")
-        body_parts.append(f"**Reported by:** GitHub Sentiment Agent user")
-        body_parts.append(f"**Model:** OLMo 2 1B Instruct")
-        body_parts.append(f"**Task:** GitHub comment sentiment classification\n")
+    if issue_type == "License Concern":
+        body_parts.append("## License Concern Report\n")
+        body_parts.append("**Reported by:** Code Provenance Checker user")
+        body_parts.append("**Tool:** Fossil Record — Code leaves fossils. This reads them.\n")
         body_parts.append(f"### Description\n{description}\n")
-        if example_comment:
-            body_parts.append(f"### Example Comment\n```\n{example_comment[:1000]}\n```\n")
-        if expected_label or actual_label:
-            body_parts.append(f"### Classification")
-            body_parts.append(f"- **Expected label:** {expected_label or 'N/A'}")
-            body_parts.append(f"- **Actual label:** {actual_label or 'N/A'}\n")
+        if snippet:
+            body_parts.append(f"### Code Snippet\n```\n{snippet[:1000]}\n```\n")
+        if detected_license or declared_license:
+            body_parts.append("### License Information")
+            body_parts.append(f"- **Your declared license:** {declared_license or 'N/A'}")
+            body_parts.append(f"- **Detected in Dolma source documents:** {detected_license or 'N/A'}\n")
         if evidence_notes:
             body_parts.append(f"### Additional Context\n{evidence_notes}\n")
 
-    elif issue_type == "Training Data Suggestion":
-        body_parts.append(f"## Training Data Suggestion\n")
-        body_parts.append(f"**Reported by:** GitHub Sentiment Agent user")
-        body_parts.append(f"**Relevant dataset:** Dolma / Tülu post-training\n")
+    elif issue_type == "Missing Attribution":
+        body_parts.append("## Missing Attribution Report\n")
+        body_parts.append("**Reported by:** Code Provenance Checker user\n")
         body_parts.append(f"### Description\n{description}\n")
-        if example_comment:
-            body_parts.append(f"### Example Data\n```\n{example_comment[:1000]}\n```\n")
+        if snippet:
+            body_parts.append(f"### Code Snippet\n```\n{snippet[:1000]}\n```\n")
+        if evidence_notes:
+            body_parts.append(f"### Evidence\n{evidence_notes}\n")
+
+    elif issue_type == "Data Quality Issue":
+        body_parts.append("## Data Quality Issue\n")
+        body_parts.append("**Reported by:** Code Provenance Checker user\n")
+        body_parts.append(f"### Description\n{description}\n")
+        if snippet:
+            body_parts.append(f"### Example\n```\n{snippet[:1000]}\n```\n")
         if evidence_notes:
             body_parts.append(f"### Why This Matters\n{evidence_notes}\n")
 
-    elif issue_type == "Feature Request":
-        body_parts.append(f"## Feature Request\n")
-        body_parts.append(f"**Reported by:** GitHub Sentiment Agent user\n")
-        body_parts.append(f"### Description\n{description}\n")
-        if evidence_notes:
-            body_parts.append(f"### Use Case\n{evidence_notes}\n")
-
     else:  # General Feedback
-        body_parts.append(f"## Feedback\n")
-        body_parts.append(f"**Reported by:** GitHub Sentiment Agent user")
-        body_parts.append(f"**Model:** OLMo 2 1B Instruct\n")
+        body_parts.append("## Feedback\n")
+        body_parts.append("**Reported by:** Code Provenance Checker user\n")
         body_parts.append(f"### Description\n{description}\n")
-        if example_comment:
-            body_parts.append(f"### Example\n```\n{example_comment[:1000]}\n```\n")
         if evidence_notes:
             body_parts.append(f"### Additional Context\n{evidence_notes}\n")
 
     body_parts.append("---")
     body_parts.append(
-        "*This issue was drafted using the [GitHub Sentiment Agent]"
-        "(https://github.com/allenai/OLMo) — "
-        "a tool for auditable AI-powered comment analysis built on OLMo.*"
+        "*Drafted via [Fossil Record](https://github.com/emmairwin/view-source-ai) — "
+        "Code leaves fossils. This reads them.*"
     )
-
     full_body = "\n".join(body_parts)
 
-    # Build the GitHub new issue URL with pre-filled content
     import urllib.parse
     params = urllib.parse.urlencode({
-        "title": title or f"[Sentiment Agent] {issue_type}",
+        "title": title or f"[Provenance] {issue_type}",
         "body": full_body,
     })
     github_url = f"{target['new_issue_url']}?{params}"
 
-    # Build a nice preview
     preview_md = f"""### 📋 Issue Preview
 
 **Target repo:** [`{target['repo']}`]({target['new_issue_url']})
@@ -173,13 +151,10 @@ def generate_issue_body(
 
 **Option 1 — Open on GitHub:**
 [Click here to open this issue on GitHub]({github_url})
-*(This will pre-fill the title and body — you just click "Submit")*
+*(Pre-fills title and body — just click "Submit")*
 
 **Option 2 — Email the team:**
 Send to `{target['email']}` with the content above.
-
-**Option 3 — Copy and paste:**
-Copy the issue body above and paste it into [{target['repo']}]({target['new_issue_url']}).
 """
 
     return preview_md, github_url, full_body
@@ -197,629 +172,7 @@ def save_issue_draft(preview_md: str, github_url: str, full_body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-DEFAULT_LABELS = {
-    "toxicity": {
-        "name": "Toxicity / Hostility",
-        "labels": ["toxic", "hostile", "dismissive", "neutral", "respectful"],
-        "description": "Detects toxic, hostile, or dismissive language in comments.",
-    },
-    "constructiveness": {
-        "name": "Constructiveness",
-        "labels": ["constructive", "unconstructive", "mixed"],
-        "description": "Whether the comment provides actionable, helpful feedback.",
-    },
-}
-
-
-@dataclass
-class SentimentConfig:
-    """Holds user-defined sentiment categories and labels."""
-    categories: dict = field(default_factory=lambda: dict(DEFAULT_LABELS))
-
-    def add_category(self, key: str, name: str, labels: list[str], description: str = ""):
-        self.categories[key] = {
-            "name": name,
-            "labels": labels,
-            "description": description,
-        }
-
-    def remove_category(self, key: str):
-        self.categories.pop(key, None)
-
-    def get_prompt_section(self) -> str:
-        lines = []
-        for key, cat in self.categories.items():
-            label_str = ", ".join(f'"{l}"' for l in cat["labels"])
-            lines.append(
-                f'- **{cat["name"]}** (key: "{key}"): '
-                f'Choose exactly one of [{label_str}]. {cat.get("description", "")}'
-            )
-        return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# GitHub API
-# ---------------------------------------------------------------------------
-
-def fetch_github_comments(repo: str, issue_number: int, token: Optional[str] = None) -> list[dict]:
-    """Fetch comments from a GitHub issue or PR."""
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    # Try issue comments
-    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    comments = resp.json()
-
-    # Also try PR review comments
-    pr_url = f"https://api.github.com/repos/{repo}/pulls/{issue_number}/comments"
-    try:
-        pr_resp = requests.get(pr_url, headers=headers, timeout=30)
-        if pr_resp.status_code == 200:
-            comments.extend(pr_resp.json())
-    except Exception:
-        pass
-
-    return [
-        {
-            "id": c["id"],
-            "user": c["user"]["login"],
-            "body": c["body"],
-            "created_at": c["created_at"],
-            "url": c.get("html_url", ""),
-        }
-        for c in comments
-        if c.get("body", "").strip()
-    ]
-
-
-def parse_repo_input(raw: str) -> tuple[str, int]:
-    """
-    Parse various GitHub URL formats or 'owner/repo#123' shorthand.
-    Returns (repo, issue_number).
-    """
-    raw = raw.strip()
-
-    # Full URL: https://github.com/owner/repo/issues/123  (protocol optional)
-    url_match = re.match(
-        r"(?:https?://)?github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)", raw
-    )
-    if url_match:
-        return url_match.group(1), int(url_match.group(2))
-
-    # Shorthand: owner/repo#123
-    short_match = re.match(r"([^#]+)#(\d+)", raw)
-    if short_match:
-        return short_match.group(1).strip(), int(short_match.group(2))
-
-    # Looks like a repo URL but missing an issue/PR number
-    repo_only = re.match(r"(?:https?://)?github\.com/([^/]+/[^/\s]+)/?$", raw)
-    if repo_only:
-        raise ValueError(
-            f"Looks like a repo URL — please include a specific issue or PR number. "
-            f"Example: {raw.rstrip('/')}/issues/1 or {repo_only.group(1)}#1"
-        )
-
-    raise ValueError(
-        "Could not parse input. Use a GitHub issue/PR URL "
-        "(e.g. github.com/owner/repo/issues/42) or 'owner/repo#42' shorthand."
-    )
-
-
-# ---------------------------------------------------------------------------
-# LLM Inference (OLMo via llama.cpp / Ollama / HF Transformers)
-# ---------------------------------------------------------------------------
-
-def build_prompt(comment_body: str, config: SentimentConfig, example_bank=None) -> list[dict]:
-    """
-    Build a chat-template prompt for OLMo Instruct.
-    Returns a list of message dicts [{"role": ..., "content": ...}].
-    We prime the assistant response with '{' so the model only has to complete the JSON.
-    """
-    # Build the exact JSON skeleton the model should fill in
-    skeleton_parts = []
-    for key, cat in config.categories.items():
-        labels_str = ", ".join(f'"{l}"' for l in cat["labels"])
-        skeleton_parts.append(
-            f'  "{key}": {{"label": <one of [{labels_str}]>, "reasoning": <why>, "evidence": [<phrases>]}}'
-        )
-    skeleton = "{\n" + ",\n".join(skeleton_parts) + "\n}"
-
-    # Few-shot examples from the bank
-    few_shot = ""
-    if example_bank:
-        raw = example_bank.get_few_shot_prompt(comment_body, config.categories)
-        if raw.strip():
-            few_shot = f"\n\nReference examples to calibrate your labels:\n{raw.strip()}"
-
-    user_content = (
-        f"Classify the following GitHub comment. "
-        f"Reply ONLY with a JSON object matching this exact structure — no prose, no markdown fences:{few_shot}\n\n"
-        f"Structure:\n{skeleton}\n\n"
-        f'Comment to classify:\n"""{comment_body[:1500]}"""'
-    )
-
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise GitHub comment sentiment classifier. "
-                "You always respond with valid JSON only. No explanation outside the JSON."
-            ),
-        },
-        {"role": "user", "content": user_content},
-    ]
-
-
-class OlmoBackend:
-    """
-    Connects to OLMo 2 1B Instruct via one of these backends (auto-detected):
-    1. Ollama (local server on port 11434)
-    2. HuggingFace transformers (direct loading)
-
-    You can override with OLMO_BACKEND=ollama or OLMO_BACKEND=transformers.
-    """
-
-    MODEL_NAME_OLLAMA = os.environ.get("OLMO_MODEL", "olmo2:1b")
-    MODEL_NAME_HF = "allenai/OLMo-2-0425-1B-Instruct"
-
-    def __init__(self):
-        import threading
-        self.backend = os.environ.get("OLMO_BACKEND", "auto")
-        self._hf_pipeline = None
-        self._load_lock = threading.Lock()  # prevent double-load race between prewarm & first click
-
-    def _try_ollama(self, messages: list) -> Optional[str]:
-        """Try Ollama chat API."""
-        try:
-            resp = requests.post(
-                "http://localhost:11434/api/chat",
-                json={
-                    "model": self.MODEL_NAME_OLLAMA,
-                    "messages": messages,
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 512},
-                },
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                return resp.json().get("message", {}).get("content", "")
-        except requests.ConnectionError:
-            return None
-        return None
-
-    def _try_transformers(self, messages: list) -> str:
-        """Load model via HuggingFace transformers and run chat inference."""
-        with self._load_lock:
-            if self._hf_pipeline is None:
-                if _hf_pipeline_fn is None:
-                    raise RuntimeError("transformers package is not installed")
-                print(f"Loading {self.MODEL_NAME_HF} via transformers (first run may download ~2GB)...")
-                self._hf_pipeline = _hf_pipeline_fn(
-                    "text-generation",
-                    model=self.MODEL_NAME_HF,
-                    device_map="auto",
-                    dtype="auto",
-                )
-                # Clear stored generation_config constraints that conflict with our kwargs
-                cfg = self._hf_pipeline.model.generation_config
-                cfg.max_length = None
-                cfg.max_new_tokens = None
-        # The pipeline accepts a list of message dicts and applies the chat template automatically
-        result = self._hf_pipeline(
-            messages,
-            max_new_tokens=512,
-            temperature=0.1,
-            do_sample=True,
-            return_full_text=False,
-        )
-        return result[0]["generated_text"]
-
-    def generate(self, messages: list) -> str:
-        """Run inference. messages is a list of {role, content} dicts."""
-        if self.backend in ("auto", "ollama"):
-            result = self._try_ollama(messages)
-            if result is not None:
-                return result
-            if self.backend == "ollama":
-                raise RuntimeError(
-                    "Ollama not reachable. Start it with: ollama serve && ollama pull olmo2:1b"
-                )
-
-        if self.backend in ("auto", "transformers"):
-            return self._try_transformers(messages)
-
-        raise RuntimeError(f"Unknown backend: {self.backend}")
-
-
-# ---------------------------------------------------------------------------
-# Module-level singletons — model loads once per process, not per click
-# ---------------------------------------------------------------------------
-
-_llm: Optional["OlmoBackend"] = None
-_example_bank: Optional["ExampleBank"] = None
-
-
-def get_llm() -> "OlmoBackend":
-    global _llm
-    if _llm is None:
-        _llm = OlmoBackend()
-    return _llm
-
-
-def get_example_bank() -> "ExampleBank":
-    global _example_bank
-    if _example_bank is None:
-        _example_bank = initialize_example_bank()
-    return _example_bank
-
-
-def prewarm_model():
-    """Load the model into memory at startup so the first Analyze click is instant."""
-    import threading
-    def _load():
-        print("Pre-warming OLMo model (this downloads ~2GB on first run, then stays loaded)...")
-        try:
-            llm = get_llm()
-            llm.generate([{"role": "user", "content": "warmup"}])
-            print("OLMo model ready.")
-        except Exception as e:
-            print(f"Pre-warm failed (will retry on first Analyze click): {e}")
-    t = threading.Thread(target=_load, daemon=True)
-    t.start()
-
-
-def parse_llm_response(raw: str, config: SentimentConfig) -> dict:
-    """Extract classification labels from LLM response, handling multiple output formats."""
-    unknown = {
-        key: {"label": "unknown", "reasoning": "", "evidence": []}
-        for key in config.categories
-    }
-
-    if not raw or not raw.strip():
-        return unknown
-
-    # Strip markdown code fences
-    text = re.sub(r"```(?:json)?\s*", "", raw).strip()
-
-    # --- Attempt 1: find outermost JSON object (handles flat or nested values) ---
-    json_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group())
-            result = {}
-            matched_any = False
-            for key in config.categories:
-                if key in parsed:
-                    val = parsed[key]
-                    matched_any = True
-                    if isinstance(val, dict):
-                        result[key] = {
-                            "label": str(val.get("label", "unknown")).lower().strip(),
-                            "reasoning": val.get("reasoning", ""),
-                            "evidence": val.get("evidence", []),
-                        }
-                    else:
-                        result[key] = {"label": str(val).lower().strip(), "reasoning": "", "evidence": []}
-                else:
-                    result[key] = {"label": "unknown", "reasoning": "", "evidence": []}
-            if matched_any:
-                return result
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # --- Attempt 2: model emitted one {"label": ...} block per category in order ---
-    # Find all top-level JSON objects in the response
-    objects = []
-    depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    obj = json.loads(text[start:i + 1])
-                    objects.append(obj)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                start = None
-
-    if objects:
-        result = {}
-        cat_keys = list(config.categories.keys())
-        for idx, key in enumerate(cat_keys):
-            obj = objects[idx] if idx < len(objects) else {}
-            label = (
-                obj.get("label")
-                or obj.get(key, {}).get("label") if isinstance(obj.get(key), dict) else None
-                or "unknown"
-            )
-            result[key] = {
-                "label": str(label).lower().strip(),
-                "reasoning": obj.get("reasoning", ""),
-                "evidence": obj.get("evidence", []),
-            }
-        return result
-
-    # --- Attempt 3: plain text labels  ("toxicity: hostile") ---
-    result = {}
-    all_labels = set()
-    for cat in config.categories.values():
-        all_labels.update(cat["labels"])
-    for key, cat in config.categories.items():
-        for label in cat["labels"]:
-            if re.search(rf"\b{re.escape(label)}\b", raw, re.IGNORECASE):
-                result[key] = {"label": label, "reasoning": "(extracted from plain text)", "evidence": []}
-                break
-        if key not in result:
-            result[key] = {"label": "unknown", "reasoning": "", "evidence": []}
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main Analysis Pipeline
-# ---------------------------------------------------------------------------
-
-def analyze_comments(
-    repo_input: str,
-    github_token: str,
-    custom_categories_json: str,
-    dolma_path: str,
-):
-    """Main entry point: fetch comments, classify each, stream results via yield."""
-
-    def _status(msg: str):
-        """Yield a status-only update, leaving outputs blank until done."""
-        return f"⏳ {msg}", "", "", "", None
-
-    # Parse config
-    config = SentimentConfig()
-    if custom_categories_json.strip():
-        try:
-            custom = json.loads(custom_categories_json)
-            for key, cat in custom.items():
-                config.add_category(
-                    key=key,
-                    name=cat.get("name", key),
-                    labels=cat["labels"],
-                    description=cat.get("description", ""),
-                )
-        except (json.JSONDecodeError, KeyError) as e:
-            yield f"❌ Invalid custom categories JSON: {e}", "", "", "", None
-            return
-
-    # Parse repo
-    try:
-        repo, issue_num = parse_repo_input(repo_input)
-    except ValueError as e:
-        yield f"❌ {e}", "", "", "", None
-        return
-
-    yield _status(f"Fetching comments from {repo}#{issue_num}...")
-
-    # Fetch comments
-    try:
-        comments = fetch_github_comments(repo, issue_num, github_token or None)
-    except requests.HTTPError as e:
-        yield f"❌ GitHub API error: {e}", "", "", "", None
-        return
-
-    if not comments:
-        yield "⚠️ No comments found on this issue/PR.", "", "", "", None
-        return
-
-    yield _status(f"Fetched {len(comments)} comment(s). Loading OLMo 2 1B Instruct...")
-
-    # Use module-level singletons — model stays loaded between clicks
-    llm = get_llm()
-    example_bank = get_example_bank()
-
-    # Classify each comment
-    results = []
-    provenance_reports = []
-    for i, comment in enumerate(comments):
-        yield _status(f"Analyzing comment {i+1} of {len(comments)} (@{comment['user']})... this may take ~30s per comment on CPU")
-        prompt = build_prompt(comment["body"], config, example_bank)
-        try:
-            raw_response = llm.generate(prompt)
-            labels = parse_llm_response(raw_response, config)
-        except Exception as e:
-            labels = {
-                key: {"label": "error", "reasoning": str(e), "evidence": []}
-                for key in config.categories
-            }
-
-        results.append({**comment, "labels": labels})
-
-        # Search training data for provenance
-        override_matches = example_bank.find_relevant(comment["body"])
-        dolma_matches = search_dolma_wimbd(comment["body"][:200])
-        if not dolma_matches and dolma_path.strip():
-            dolma_matches = search_dolma_local(comment["body"][:200], dolma_path.strip())
-
-        prov = build_provenance_report(comment["body"], labels, dolma_matches, override_matches)
-        provenance_reports.append({"comment_user": comment["user"], "report": prov})
-
-    # Format outputs
-    markdown = format_results_markdown(results, config, repo, issue_num)
-    json_output = json.dumps(results, indent=2, default=str)
-
-    # Build combined provenance markdown
-    prov_md_parts = ["# 🔍 Data Provenance: View Source\n"]
-    prov_md_parts.append(
-        "*For each comment, here's what data shaped the model's decision "
-        "and how you can change it.*\n---\n"
-    )
-    for pr in provenance_reports:
-        prov_md_parts.append(f"## Comment by @{pr['comment_user']}\n")
-        prov_md_parts.append(format_provenance_markdown(pr["report"]))
-        prov_md_parts.append("\n---\n")
-    provenance_md = "\n".join(prov_md_parts)
-
-    provenance_chart = build_provenance_chart(provenance_reports)
-    yield f"✅ Done! Analyzed {len(results)} comment(s).", markdown, json_output, provenance_md, provenance_chart
-
-
-def format_results_markdown(
-    results: list[dict], config: SentimentConfig, repo: str, issue_num: int
-) -> str:
-    """Format results as a readable Markdown report with reasoning."""
-    lines = [
-        f"# Sentiment Analysis: {repo}#{issue_num}",
-        f"**Model:** OLMo 2 1B Instruct (Allen AI) — fully open-source, trained on Dolma",
-        f"**Comments analyzed:** {len(results)}",
-        f"**Categories:** {', '.join(cat['name'] for cat in config.categories.values())}",
-        "",
-        "---",
-        "",
-    ]
-
-    # Define which labels are "flagged" (negative/concerning)
-    flagged_labels = {
-        "toxic", "hostile", "dismissive", "unconstructive", "critical",
-        "hateful", "aggressive", "abusive", "negative", "harmful",
-    }
-
-    # Summary stats
-    lines.append("## Summary")
-    for key, cat in config.categories.items():
-        lines.append(f"\n### {cat['name']}")
-        label_counts = {}
-        for r in results:
-            label = r["labels"].get(key, {}).get("label", "unknown")
-            label_counts[label] = label_counts.get(label, 0) + 1
-        for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
-            pct = count / len(results) * 100
-            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-            flag = " ⚠️" if label in flagged_labels else ""
-            lines.append(f"  {bar} **{label}**: {count} ({pct:.0f}%){flag}")
-
-    # Flagged comments section (toxic/hostile/etc get special treatment)
-    flagged_comments = []
-    for r in results:
-        for key, val in r["labels"].items():
-            if val.get("label", "") in flagged_labels:
-                flagged_comments.append((r, key, val))
-
-    if flagged_comments:
-        lines.append("\n---\n## ⚠️ Flagged Comments\n")
-        lines.append("*These comments were classified with concerning labels. "
-                      "The model explains its reasoning and highlights the specific "
-                      "language that triggered the flag.*\n")
-        for r, cat_key, val in flagged_comments:
-            cat_name = config.categories[cat_key]["name"]
-            body_preview = r["body"][:300].replace("\n", " ")
-            if len(r["body"]) > 300:
-                body_preview += "..."
-
-            lines.append(f"### @{r['user']} — {r['created_at'][:10]}")
-            lines.append(f"> {body_preview}\n")
-            lines.append(f"**{cat_name}:** 🔴 `{val['label']}`\n")
-
-            if val.get("reasoning"):
-                lines.append(f"**Why this was flagged:** {val['reasoning']}\n")
-
-            if val.get("evidence"):
-                evidence_list = val["evidence"]
-                if isinstance(evidence_list, list) and evidence_list:
-                    highlighted = ", ".join(f'`"{e}"`' for e in evidence_list)
-                    lines.append(f"**Triggering language:** {highlighted}\n")
-
-            lines.append('> 📊 **See the "View Source (Provenance)" tab** for a full breakdown of what training data shaped this label.\n')
-            if r.get("url"):
-                lines.append(f"[View on GitHub]({r['url']})")
-            lines.append("")
-
-    # Per-comment detail
-    lines.append("\n---\n## All Comments\n")
-    for r in results:
-        body_preview = r["body"][:200].replace("\n", " ")
-        if len(r["body"]) > 200:
-            body_preview += "..."
-        lines.append(f"### @{r['user']} — {r['created_at'][:10]}")
-        lines.append(f"> {body_preview}\n")
-
-        for k, val in r["labels"].items():
-            cat_name = config.categories[k]["name"]
-            label = val.get("label", "unknown")
-            is_flagged = label in flagged_labels
-            icon = "🔴" if is_flagged else "🟢"
-            lines.append(f"  {icon} **{cat_name}:** `{label}`")
-
-            # Show reasoning for all comments, not just flagged
-            if val.get("reasoning"):
-                lines.append(f"    *Reasoning: {val['reasoning']}*")
-            if val.get("evidence") and isinstance(val["evidence"], list) and val["evidence"]:
-                highlighted = ", ".join(f'"{e}"' for e in val["evidence"])
-                lines.append(f"    *Evidence: {highlighted}*")
-
-        if r.get("url"):
-            lines.append(f"\n[View on GitHub]({r['url']})")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------------------------
-
-EXAMPLE_CUSTOM_JSON = json.dumps(
-    {
-        "urgency": {
-            "name": "Urgency",
-            "labels": ["critical", "important", "low-priority", "informational"],
-            "description": "How urgent is the issue raised in this comment?",
-        }
-    },
-    indent=2,
-)
-
-INFO_MD = """
-## About This Agent
-
-**Model:** [OLMo 2 1B Instruct](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct) by Allen AI
-**Training Data:** [Dolma](https://huggingface.co/datasets/allenai/dolma) — fully open and documented
-**License:** Apache 2.0
-
-### The "View Source" Philosophy
-
-Traditional software has View Source — you can see exactly what makes it work and change it.
-This agent brings that to AI:
-
-1. **TRACE** — When the model makes a decision, see what training data likely influenced it
-2. **INSPECT** — Every classification comes with reasoning and evidence
-3. **OVERRIDE** — Edit the local example bank to steer the model's behavior
-4. **CONTRIBUTE** — Draft and file issues directly to Allen AI's open repos to improve the model for everyone
-
-### Contribute Upstream
-
-Unlike closed models where feedback goes into a void, OLMo's open nature means you can:
-- File misclassification reports on [allenai/OLMo](https://github.com/allenai/OLMo)
-- Suggest training data improvements on [allenai/dolma](https://github.com/allenai/dolma)
-- Contribute post-training examples on [allenai/open-instruct](https://github.com/allenai/open-instruct)
-- Use [OLMoTrace](https://playground.allenai.org) to find the training data behind a decision
-- Email the team at olmo@allenai.org
-
-### Backends (auto-detected)
-1. **Ollama** (recommended): `ollama pull olmo2:1b && ollama serve`
-2. **HuggingFace Transformers**: Auto-downloads on first run (~2GB)
-
-Set `OLMO_BACKEND=ollama` or `OLMO_BACKEND=transformers` to force one.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Example Bank UI Helpers
+# Example Bank — module-level singleton
 # ---------------------------------------------------------------------------
 
 _bank = initialize_example_bank()
@@ -828,7 +181,7 @@ _bank = initialize_example_bank()
 def get_bank_display():
     items = _bank.to_display_list()
     if not items:
-        return "No examples in bank yet."
+        return "No patterns in bank yet."
     lines = []
     for item in items:
         labels = ", ".join(f"{k}: **{v}**" for k, v in item["labels"].items())
@@ -846,7 +199,7 @@ def add_example(text, labels_json, source, notes):
     except json.JSONDecodeError:
         return "❌ Invalid labels JSON", get_bank_display()
     _bank.add(text, labels, source, notes)
-    return "✅ Example added", get_bank_display()
+    return "✅ Pattern added", get_bank_display()
 
 
 def remove_example(index):
@@ -856,7 +209,7 @@ def remove_example(index):
         return "❌ Enter a valid index number", get_bank_display()
     result = _bank.remove(idx)
     if result:
-        return f"✅ Removed example {idx}", get_bank_display()
+        return f"✅ Removed pattern {idx}", get_bank_display()
     return "❌ Index not found", get_bank_display()
 
 
@@ -867,9 +220,358 @@ def export_bank():
 def import_bank(data):
     try:
         count = _bank.import_json(data)
-        return f"✅ Imported {count} examples", get_bank_display()
+        return f"✅ Imported {count} patterns", get_bank_display()
     except Exception as e:
         return f"❌ Import failed: {e}", get_bank_display()
+
+
+# ---------------------------------------------------------------------------
+# Snippet Provenance Pipeline
+# ---------------------------------------------------------------------------
+
+INFO_MD = """
+## About Fossil Record
+
+*Code leaves fossils. This reads them.*
+
+When an AI model trains on code, that code leaves an impression — like a fossil in rock.
+Fossil Record searches [Dolma](https://huggingface.co/datasets/allenai/dolma), the fully open
+3-trillion-token dataset used to train OLMo, to find those impressions: exact phrases,
+the documents they came from, and the licenses those documents carried.
+
+**Dataset:** [Dolma v1.7](https://huggingface.co/datasets/allenai/dolma) — OLMo's training corpus (fully open and documented)
+**Search API:** [infini-gram](https://infini-gram.io) — exact-phrase search over the full corpus
+**License:** Apache 2.0
+
+### What It Does
+
+1. **TRACE** — Search your code snippet against Dolma to find exact-phrase matches in OLMo's training data
+2. **INSPECT** — For each match, see source context and any license strings detected in the document
+3. **FLAG** — Get per-line 🟢/🟡/🔴/⚪ compatibility flags comparing source licenses to your project's license
+4. **CONTRIBUTE** — Report license gaps and data quality issues directly to Allen AI's open repos
+
+### The Fossil Analogy
+
+Paleontologists don't have every specimen — they read the record from fragments.
+Fossil Record works the same way: a single distinctive function signature is enough
+to identify the library, its license, and whether it belongs in your project.
+The gaps in the record (deduplication, missing license headers, minified bundles)
+are part of the story too.
+
+### Flag Meanings
+
+| Flag | When you see it | Severity |
+|------|----------------|----------|
+| 🟢 | Found in Dolma — source license matches (or is compatible with) your declared license | OK |
+| 🟡 | Found in Dolma — permissive/permissive mismatch, or no license info available | Low |
+| 🔴 | Found in Dolma — permissive/copyleft conflict requiring legal review | High |
+| ⚪ | Not found in Dolma training data | — |
+
+**Permissive vs. Copyleft:**
+- 🟡 *MIT declared, Apache-2.0 in source* — both permissive, different attribution requirements
+- 🔴 *MIT declared, GPL-3.0 in source* — copyleft is "viral"; combining may force you to adopt GPL terms
+
+### Test Cases
+
+**🔴 React + GPL-3.0** — paste React's `createElement` signature, set license to GPL-3.0.
+React is MIT-licensed, so the source license (MIT detected in Dolma) is permissive and yours
+is copyleft → Dolma source is fine for your GPL project, so actually 🟢.
+
+Try the reverse: declare MIT and paste GPL-licensed code → 🔴 (copyleft source, permissive declaration).
+
+**🟢 MIT header** — paste `Permission is hereby granted…`, set license to MIT.
+Should get ~900K+ hits, MIT source, MIT declared → 🟢.
+
+**🟡 MIT declared, Apache-2.0 code** — paste Apache-licensed code, set license to MIT.
+Both permissive but different → 🟡 to flag the attribution-clause difference.
+
+### Contribute Upstream
+
+Because Dolma is fully open, you can report issues directly:
+- Data quality / license concerns: [allenai/dolma](https://github.com/allenai/dolma/issues)
+- Model behavior issues: [allenai/OLMo](https://github.com/allenai/OLMo/issues)
+- Trace model outputs to training data: [OLMoTrace](https://playground.allenai.org)
+- Email: olmo@allenai.org
+"""
+
+
+# ---------------------------------------------------------------------------
+# License choices — grouped with visual separators for the dropdown
+# ---------------------------------------------------------------------------
+
+# Tuples of (display_label, value).  Items whose value starts with "──" are
+# group-header separators; the normalize helper below converts them to "".
+LICENSE_CHOICES: list[tuple[str, str]] = [
+    ("── Permissive ──",  "── Permissive ──"),
+    ("  MIT",             "MIT"),
+    ("  Apache-2.0",      "Apache-2.0"),
+    ("  BSD-2-Clause",    "BSD-2-Clause"),
+    ("  BSD-3-Clause",    "BSD-3-Clause"),
+    ("  ISC",             "ISC"),
+    ("── Copyleft ──",    "── Copyleft ──"),
+    ("  GPL-2.0",         "GPL-2.0"),
+    ("  GPL-3.0",         "GPL-3.0"),
+    ("  AGPL-3.0",        "AGPL-3.0"),
+    ("  LGPL-2.1",        "LGPL-2.1"),
+    ("  MPL-2.0",         "MPL-2.0"),
+    ("── Other ──",       "── Other ──"),
+    ("  Proprietary",     "Proprietary"),
+    ("  Unlicensed",      "Unlicensed"),
+]
+
+_LICENSE_VALUES = [v for _, v in LICENSE_CHOICES]
+
+
+def _normalize_user_license(raw: str) -> str:
+    """Convert a dropdown value to a clean license string for compatibility checks.
+    Group-header separators and "I don't know" map to empty string (= unknown)."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if s.startswith("──"):
+        return ""
+    return s
+
+
+EXAMPLE_LABELS_JSON = json.dumps(
+    {"provenance": "known-pattern", "library": "my-library", "license": "MIT"},
+    indent=2,
+)
+
+
+def analyze_snippet(snippet: str, user_license: str = ""):
+    """
+    Check a code snippet against Dolma training data.
+    Extracts 3-5 distinctive lines, counts each in Dolma, fetches source docs,
+    detects licenses, and flags compatibility against the user's declared license.
+    Yields: (status, report_md, json_out, provenance_md, chart, flag_md)
+    """
+
+    def _status(msg: str):
+        return f"⏳ {msg}", "", "", "", None, ""
+
+    if not snippet or not snippet.strip():
+        yield "⚠️ Please paste a code snippet to analyze.", "", "", "", None, ""
+        return
+
+    non_blank = [l for l in snippet.splitlines() if l.strip()]
+    if len(non_blank) > 50:
+        yield "❌ Snippet is too long (max 50 non-blank lines). Please trim it.", "", "", "", None, ""
+        return
+
+    effective_license = _normalize_user_license(user_license)
+    if not effective_license:
+        yield "⚠️ Please select your project's license from the dropdown before checking.", "", "", "", None, ""
+        return
+
+    yield _status("Extracting distinctive lines from snippet…")
+
+    phrases = extract_snippet_phrases(snippet)
+    if not phrases:
+        yield (
+            "⚠️ Could not extract distinctive phrases "
+            "(snippet may be too short or consist only of imports/single-word lines).",
+            "", "", "", None, "",
+        )
+        return
+
+    phrase_preview = "\n".join(f"- `{p}`" for p in phrases)
+    yield _status(f"Searching {len(phrases)} line(s) in Dolma:\n\n{phrase_preview}")
+
+    provenance = search_snippet_provenance(snippet, bank=_bank)
+    report_md = format_snippet_provenance_markdown(provenance, effective_license)
+    json_out = json.dumps(provenance, indent=2, default=str)
+
+    assessment = assess_license_compatibility(
+        effective_license, provenance.get("all_detected_licenses", [])
+    )
+    flag_icons = {"green": "🟢", "yellow": "🟡", "red": "🔴", "white": "⚪"}
+    flag_icon = flag_icons.get(assessment["flag"], "⚪")
+    flag_md = f"## {flag_icon} {assessment['explanation']}"
+
+    fake_reports = [
+        {
+            "comment_user": "snippet",
+            "report": {
+                "provenance": {
+                    "training_data_matches": [{
+                        "exact_phrase": item["phrase"],
+                        "exact_count": item["count"],
+                        "exact_docs": item["docs"],
+                        "sub_phrase_counts": [],
+                    }]
+                }
+            },
+        }
+        for item in provenance["phrases"]
+    ]
+    chart = build_provenance_chart(fake_reports)
+
+    hit_count = sum(1 for item in provenance["phrases"] if item["count"] > 0)
+    yield (
+        f"✅ Done — {hit_count} of {len(phrases)} line(s) found in Dolma.",
+        report_md,
+        json_out,
+        report_md,
+        chart,
+        flag_md,
+    )
+
+
+def draft_dolma_issue(snippet: str, user_license: str, flag_md: str) -> tuple[str, str]:
+    """Build a pre-filled GitHub issue for allenai/dolma."""
+    if not snippet or not snippet.strip():
+        return "⚠️ No snippet to report.", ""
+    effective_license = _normalize_user_license(user_license)
+    provenance = search_snippet_provenance(snippet, bank=_bank)
+    assessment = assess_license_compatibility(
+        effective_license, provenance.get("all_detected_licenses", [])
+    )
+    preview, url = build_dolma_issue_body(snippet, effective_license, assessment, provenance)
+    return preview, url
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+
+MIT_TEST_PHRASE = "Permission is hereby granted, free of charge, to any person obtaining a copy"
+
+
+def run_debug_query(query: str) -> tuple[str, str]:
+    """
+    Call infini-gram directly with `query` and return:
+      - A human-readable summary (Markdown)
+      - The raw JSON responses formatted for display
+    """
+    if not query or not query.strip():
+        return "⚠️ Enter a query.", ""
+
+    print(f"[DEBUG TAB] running debug_single_query for: {query!r}", flush=True)
+    result = debug_single_query(query.strip())
+
+    # ── Summary (Markdown) ──────────────────────────────────────────────
+    count = result.get("count_parsed") or result.get("docs_parsed_count") or 0
+    count_str = f"{count:,}" if isinstance(count, int) else str(count)
+    error = result.get("error", "")
+
+    lines = []
+    lines.append(f"## Query: `{result['query']}`\n")
+    lines.append(f"**API:** `{result['api_url']}`  **Index:** `{result['index']}`\n")
+
+    if error:
+        lines.append(f"### ❌ Error\n```\n{error}\n```\n")
+    else:
+        lines.append(f"### Count result: **{count_str}** occurrences in Dolma\n")
+        if count == 0:
+            lines.append(
+                "> ⚠️ Zero hits. Either the query has no exact matches in Dolma, "
+                "or there's an API/network issue. Check the raw response below."
+            )
+        else:
+            lines.append(f"> ✅ Found {count_str} exact occurrences.")
+
+    lines.append("\n---\n### Sub-phrase counts (4–6 word windows + long words)\n")
+    sub = result.get("sub_phrase_counts", [])
+    if sub:
+        for item in sub[:20]:
+            c = item.get("count", -1)
+            c_str = f"{c:,}" if isinstance(c, int) and c >= 0 else "(error)"
+            icon = "✅" if c > 0 else "⚪"
+            lines.append(f"- {icon} `{item['phrase']}` → **{c_str}**")
+    else:
+        lines.append("*No sub-phrases generated.*")
+
+    docs = result.get("docs_parsed_documents") or []
+    lines.append(f"\n---\n### Sample documents returned: {len(docs)}\n")
+    for i, doc in enumerate(docs, 1):
+        lines.append(f"**Doc {i}:**")
+        preview = doc.get("full_text_preview", "").replace("\n", " ")
+        lines.append(f"```\n{preview[:400]}\n```")
+        lines.append(f"*Metadata raw (first 200):* `{doc.get('metadata_raw','')[:200]}`\n")
+
+    summary = "\n".join(lines)
+
+    # ── Raw JSON ─────────────────────────────────────────────────────────
+    raw_out = json.dumps(result, indent=2, default=str)
+
+    return summary, raw_out
+
+
+def preview_extraction(snippet: str) -> str:
+    """Show exactly which lines extract_snippet_phrases would pick and why."""
+    if not snippet or not snippet.strip():
+        return "⚠️ Paste a snippet first."
+
+    import re as _re
+
+    lines_info = []
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        reasons = []
+        skipped = False
+
+        if _re.match(r'^(?:import\s+\S|from\s+\S+\s+import)\b', stripped):
+            skipped = True
+            reasons.append("SKIP: import statement")
+        elif len(stripped) < 15:
+            skipped = True
+            reasons.append(f"SKIP: too short ({len(stripped)} chars, min 15)")
+        else:
+            score = 0.0
+            if _re.search(
+                r'SPDX-License-Identifier|permission\s+is\s+hereby|copyright|\ball\s+rights\s+reserved\b|licensed\s+under',
+                stripped, _re.IGNORECASE
+            ):
+                score += 10
+                reasons.append("+10 license/copyright keyword")
+            if _re.match(r'#|//|\*+\s|/\*', stripped):
+                score += 4
+                reasons.append("+4 comment line")
+            if _re.search(r'\b(raise|error|exception|warn|assert|fail)\b', stripped, _re.IGNORECASE):
+                score += 3
+                reasons.append("+3 error/raise")
+            if _re.match(r'(?:def |class |function |public |private |static |async\s+def |fn )\w', stripped):
+                score += 3
+                reasons.append("+3 function/class def")
+            if _re.search(r'["\'](?:[^"\']{10,})["\']', stripped):
+                score += 2
+                reasons.append("+2 quoted string")
+            length_bonus = min(len(stripped) / 25.0, 4.0)
+            score += length_bonus
+            reasons.append(f"+{length_bonus:.1f} length ({len(stripped)} chars)")
+            reasons.append(f"= score {score:.1f}")
+
+        phrase = (stripped[:100].rsplit(' ', 1)[0] if len(stripped) > 100 else stripped).rstrip(',;:').strip()
+        lines_info.append((skipped, score if not skipped else -1, stripped, phrase, reasons))
+
+    # Sort same as the real function
+    eligible = [(s, ln, p, r) for sk, s, ln, p, r in lines_info if not sk]
+    eligible.sort(key=lambda x: (-x[0], -len(x[1])))
+    chosen_phrases = set()
+    chosen = []
+    for score, line, phrase, _ in eligible:
+        if phrase not in chosen_phrases:
+            chosen_phrases.add(phrase)
+            chosen.append(phrase)
+        if len(chosen) >= 5:
+            break
+
+    out = ["## Phrase Extraction Preview\n"]
+    out.append("### Lines evaluated\n")
+    for skipped, score, line, phrase, reasons in lines_info:
+        marker = "⏭️ skip" if skipped else ("✅ CHOSEN" if phrase in chosen_phrases else "  scored")
+        reason_str = " | ".join(reasons)
+        out.append(f"- **[{marker}]** `{line[:80]}` — {reason_str}")
+
+    out.append(f"\n### Final phrases sent to API ({len(chosen)} total)\n")
+    for i, p in enumerate(chosen, 1):
+        out.append(f"{i}. `{p}`")
+
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -878,118 +580,155 @@ def import_bank(data):
 
 def build_ui():
     with gr.Blocks(
-        title="GitHub Sentiment Agent — OLMo 2 (View Source Edition)",
+        title="View Source for AI — Code Snippet Source and License",
     ) as app:
-        gr.Markdown("# 🔍 GitHub Comment Sentiment Agent")
+        gr.Markdown("# View Source for AI — Code Snippet Source and License")
         gr.Markdown(
-            "*Powered by OLMo 2 1B Instruct — fully open model, fully open data, fully auditable*"
+            "*Code leaves fossils in AI training data. Paste a snippet — see if it appears in "
+            "[Dolma](https://huggingface.co/datasets/allenai/dolma), "
+            "OLMo's 3-trillion-token training corpus, what license it carried there, "
+            "and whether that's compatible with your project.*"
         )
 
         with gr.Tabs():
-            # ---- TAB 1: ANALYZE ----
-            with gr.Tab("🔬 Analyze"):
+            # ----------------------------------------------------------------
+            # TAB 1: CHECK SNIPPET
+            # ----------------------------------------------------------------
+            with gr.Tab("🔬 Check Snippet"):
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        repo_input = gr.Textbox(
-                            label="GitHub Issue / PR",
-                            placeholder="https://github.com/owner/repo/issues/123  or  owner/repo#123",
-                            info="Paste a full URL or use shorthand notation",
-                        )
-                        github_token = gr.Textbox(
-                            label="GitHub Token (optional)",
-                            placeholder="ghp_...",
-                            type="password",
-                            info="Needed for private repos or to avoid rate limits",
-                        )
-                        dolma_path = gr.Textbox(
-                            label="Local Dolma Path (optional)",
-                            placeholder="/path/to/dolma/subset",
-                            info="If you downloaded a Dolma subset, point here for local training data search",
+                    with gr.Column(scale=3):
+                        snippet_input = gr.Textbox(
+                            label="code snippet",
+                            placeholder=(
+                                "Paste your code snippet here…\n\n"
+                                "Test 🟢 — MIT header, declare MIT:\n"
+                                "Permission is hereby granted, free of charge, to any person obtaining a copy\n\n"
+                                "Test 🟡 — Apache source, declare MIT (permissive/permissive mismatch):\n"
+                                "Licensed under the Apache License, Version 2.0\n\n"
+                                "Test 🔴 — copyleft source, declare MIT:\n"
+                                "This program is free software: you can redistribute it and/or modify it\n"
+                                "under the terms of the GNU General Public License"
+                            ),
+                            lines=14,
+                            max_lines=50,
                         )
                     with gr.Column(scale=1):
-                        gr.Markdown("*Add your own sentiment categories. Leave empty to use defaults.*")
-                        custom_json = gr.Code(
-                            label="Custom Categories (optional JSON)",
-                            language="json",
-                            value="",
-                            lines=8,
+                        user_license_input = gr.Dropdown(
+                            label="Your project's license",
+                            choices=LICENSE_CHOICES,
+                            value=None,
+                            info=(
+                                "The license under which **you** will use or distribute this code. "
+                                "Used to check whether the source license(s) found in Dolma "
+                                "are compatible with your project."
+                            ),
                         )
-                        with gr.Accordion("Example custom category", open=False):
-                            gr.Code(value=EXAMPLE_CUSTOM_JSON, language="json", interactive=False)
+                        gr.Markdown(
+                            "**Flag meanings:**\n\n"
+                            "🟢 Compatible — same or allowed license\n\n"
+                            "🟡 Check attribution — permissive mismatch\n\n"
+                            "🔴 Conflict — copyleft source vs permissive project\n\n"
+                            "⚪ No license info (select yours above to compare)"
+                        )
 
-                analyze_btn = gr.Button("🚀 Analyze Comments", variant="primary", size="lg")
-                status_box = gr.Markdown(value="", label="Status")
+                check_btn = gr.Button("🔎 Check Provenance", variant="primary", size="lg")
+                status_box = gr.Markdown(value="")
+                flag_output = gr.Markdown(value="")
 
                 with gr.Tabs():
-                    with gr.Tab("📊 Report"):
-                        report_output = gr.Markdown(label="Report")
-                    with gr.Tab("🔍 View Source (Provenance)"):
-                        provenance_chart_output = gr.Plot(
-                            label="Training Data Signal",
-                            visible=True,
-                        )
-                        provenance_output = gr.Markdown(label="Data Provenance")
+                    with gr.Tab("📊 Results"):
+                        report_output = gr.Markdown(label="Per-Line Provenance Results")
+                    with gr.Tab("📈 Dolma Hit Chart"):
+                        provenance_chart_output = gr.Plot(label="Dolma Occurrence Counts")
+                    with gr.Tab("🔍 Full Provenance"):
+                        provenance_output = gr.Markdown(label="Full Data Provenance")
                     with gr.Tab("📋 Raw JSON"):
                         json_output = gr.Code(label="JSON", language="json")
 
-                analyze_btn.click(
-                    fn=analyze_comments,
-                    inputs=[repo_input, github_token, custom_json, dolma_path],
-                    outputs=[status_box, report_output, json_output, provenance_output, provenance_chart_output],
+                check_btn.click(
+                    fn=analyze_snippet,
+                    inputs=[snippet_input, user_license_input],
+                    outputs=[
+                        status_box, report_output, json_output,
+                        provenance_output, provenance_chart_output, flag_output,
+                    ],
                 )
 
-            # ---- TAB 2: EDIT SOURCE (Example Bank) ----
+                gr.Markdown("---")
+                with gr.Accordion("🎫 Draft issue to allenai/dolma (for 🟡/🔴 flags)", open=False):
+                    gr.Markdown(
+                        "Found a license mismatch or missing attribution? "
+                        "Draft a data-quality issue to "
+                        "[allenai/dolma](https://github.com/allenai/dolma/issues) "
+                        "with your snippet, Dolma hit counts, and source context pre-filled."
+                    )
+                    draft_issue_btn = gr.Button("🎫 Build Issue Draft", variant="secondary")
+                    issue_preview = gr.Markdown()
+                    issue_url_box = gr.Textbox(
+                        label="GitHub URL (pre-filled — open in browser to submit)",
+                        interactive=False,
+                    )
+                    draft_issue_btn.click(
+                        fn=draft_dolma_issue,
+                        inputs=[snippet_input, user_license_input, flag_output],
+                        outputs=[issue_preview, issue_url_box],
+                    )
+
+            # ----------------------------------------------------------------
+            # TAB 2: EDIT SOURCE (Known Pattern Bank)
+            # ----------------------------------------------------------------
             with gr.Tab("✏️ Edit Source"):
-                gr.Markdown("## Local Example Bank\n")
+                gr.Markdown("## Known Pattern Bank\n")
                 gr.Markdown(
-                    "This is your **edit source** layer. Examples here are injected into "
-                    "the model's prompt as few-shot context, directly steering how it classifies. "
-                    "Add examples to teach it your definitions. Remove ones that mislead it."
+                    "A local database of known code patterns with confirmed libraries "
+                    "and licenses. When a Dolma search returns a match, the tool "
+                    "cross-references it here to annotate well-known signatures.\n\n"
+                    "Seed entries cover: MIT/Apache/GPL/BSD headers, "
+                    "React `createElement`, Lodash exports, Flask `wsgi_app`, "
+                    "Meta/JetBrains copyright markers."
                 )
 
-                bank_display = gr.Markdown(value=get_bank_display, label="Current Examples")
+                bank_display = gr.Markdown(value=get_bank_display)
 
-                gr.Markdown("### Add Example")
+                gr.Markdown("### Add Pattern")
                 with gr.Row():
                     with gr.Column():
                         new_text = gr.Textbox(
-                            label="Comment Text",
-                            placeholder="Paste a GitHub comment here...",
+                            label="Code Line / Signature",
+                            placeholder="Paste the distinctive line or function signature…",
                             lines=3,
                         )
                         new_labels = gr.Code(
                             label="Labels (JSON)",
                             language="json",
-                            value='{"toxicity": "hostile", "constructiveness": "unconstructive"}',
-                            lines=3,
+                            value=EXAMPLE_LABELS_JSON,
+                            lines=4,
                         )
                     with gr.Column():
                         new_source = gr.Textbox(
                             label="Source",
                             value="user",
-                            info="Where this came from (user, github, dolma, etc.)",
+                            info="Where this came from (user, npm, pypi, github, etc.)",
                         )
                         new_notes = gr.Textbox(
                             label="Notes",
-                            placeholder="Why you're adding this example...",
-                            lines=2,
+                            placeholder="Library name, version, license, why you're adding this…",
+                            lines=3,
                         )
 
-                add_btn = gr.Button("➕ Add Example", variant="primary")
+                add_btn = gr.Button("➕ Add Pattern", variant="primary")
                 add_status = gr.Markdown("")
-
                 add_btn.click(
                     fn=add_example,
                     inputs=[new_text, new_labels, new_source, new_notes],
                     outputs=[add_status, bank_display],
                 )
 
-                gr.Markdown("### Remove Example")
+                gr.Markdown("### Remove Pattern")
                 with gr.Row():
                     remove_idx = gr.Number(label="Index to Remove", precision=0)
                     remove_btn = gr.Button("🗑️ Remove", variant="stop")
                 remove_status = gr.Markdown("")
-
                 remove_btn.click(
                     fn=remove_example,
                     inputs=[remove_idx],
@@ -999,14 +738,14 @@ def build_ui():
                 gr.Markdown("### Import / Export")
                 with gr.Row():
                     with gr.Column():
-                        export_btn = gr.Button("📤 Export Bank as JSON")
+                        export_btn = gr.Button("📤 Export as JSON")
                         export_output = gr.Code(label="Exported JSON", language="json")
                         export_btn.click(fn=export_bank, outputs=[export_output])
                     with gr.Column():
                         import_input = gr.Code(
                             label="Paste JSON to Import", language="json", lines=5
                         )
-                        import_btn = gr.Button("📥 Import Examples")
+                        import_btn = gr.Button("📥 Import")
                         import_status = gr.Markdown("")
                         import_btn.click(
                             fn=import_bank,
@@ -1014,14 +753,17 @@ def build_ui():
                             outputs=[import_status, bank_display],
                         )
 
-            # ---- TAB 3: CONTRIBUTE UPSTREAM ----
+            # ----------------------------------------------------------------
+            # TAB 3: CONTRIBUTE UPSTREAM
+            # ----------------------------------------------------------------
             with gr.Tab("🎫 Contribute Upstream"):
-                gr.Markdown("## Improve OLMo — Open a Ticket\n")
+                gr.Markdown("## Report Issues to Allen AI\n")
                 gr.Markdown(
-                    "Found a misclassification? Think the training data is missing something? "
-                    "Because OLMo is fully open, you can file issues directly with Allen AI's "
-                    "repositories. This tab drafts a well-formatted issue for you.\n\n"
-                    "**Your feedback goes directly to the people who build the model and its data.**"
+                    "Found a license problem, missing attribution, or data quality "
+                    "issue in Dolma? Because Dolma is fully open, you can file issues "
+                    "directly with the team.\n\n"
+                    "**Your feedback goes directly to the people who build and "
+                    "maintain the training data.**"
                 )
 
                 gr.Markdown("### Where to Send It")
@@ -1037,61 +779,58 @@ def build_ui():
                     with gr.Column():
                         ticket_target = gr.Dropdown(
                             label="Target Repository",
-                            choices=[
-                                (v["name"], k) for k, v in UPSTREAM_TARGETS.items()
-                            ],
-                            value="model_behavior",
+                            choices=[(v["name"], k) for k, v in UPSTREAM_TARGETS.items()],
+                            value="training_data",
                         )
                         ticket_type = gr.Dropdown(
                             label="Issue Type",
                             choices=[
-                                "Misclassification Report",
-                                "Training Data Suggestion",
-                                "Feature Request",
+                                "License Concern",
+                                "Missing Attribution",
+                                "Data Quality Issue",
                                 "General Feedback",
                             ],
-                            value="Misclassification Report",
+                            value="License Concern",
                         )
                         ticket_title = gr.Textbox(
                             label="Issue Title",
-                            placeholder="e.g., Blunt code review misclassified as toxic",
+                            placeholder="e.g., GPL-licensed code found in Dolma without attribution",
                         )
                     with gr.Column():
                         ticket_description = gr.Textbox(
                             label="Description",
-                            placeholder="Describe the problem or suggestion in detail...",
+                            placeholder="Describe the problem or concern in detail…",
                             lines=4,
                         )
-                        ticket_example = gr.Textbox(
-                            label="Example Comment (optional)",
-                            placeholder="Paste the GitHub comment that was misclassified...",
+                        ticket_snippet = gr.Textbox(
+                            label="Code Snippet (optional)",
+                            placeholder="Paste the code snippet that triggered this report…",
                             lines=3,
                         )
 
                 with gr.Row():
                     with gr.Column():
-                        ticket_expected = gr.Textbox(
-                            label="Expected Label (optional)",
-                            placeholder="e.g., neutral",
+                        ticket_detected = gr.Textbox(
+                            label="Detected License in Dolma Source (optional)",
+                            placeholder="e.g., GPL-3.0",
                         )
                     with gr.Column():
-                        ticket_actual = gr.Textbox(
-                            label="Actual Label (optional)",
-                            placeholder="e.g., hostile",
+                        ticket_declared = gr.Textbox(
+                            label="Your Declared License (optional)",
+                            placeholder="e.g., MIT",
                         )
 
                 ticket_evidence = gr.Textbox(
                     label="Additional Context / Evidence (optional)",
                     placeholder=(
-                        "e.g., OLMoTrace showed similar training data from Reddit that "
-                        "uses this phrasing in a non-hostile context..."
+                        "Dolma hit counts, infini-gram search links, "
+                        "source document URLs, why this is a problem…"
                     ),
                     lines=3,
                 )
 
                 draft_btn = gr.Button("📝 Draft Issue", variant="primary", size="lg")
-
-                ticket_preview = gr.Markdown(label="Issue Preview")
+                ticket_preview = gr.Markdown()
                 ticket_url = gr.Textbox(label="GitHub URL (pre-filled)", visible=False)
                 ticket_body = gr.Textbox(label="Raw Body", visible=False)
 
@@ -1103,38 +842,86 @@ def build_ui():
                     fn=generate_issue_body,
                     inputs=[
                         ticket_target, ticket_type, ticket_title,
-                        ticket_description, ticket_example,
-                        ticket_expected, ticket_actual, ticket_evidence,
+                        ticket_description, ticket_snippet,
+                        ticket_detected, ticket_declared, ticket_evidence,
                     ],
                     outputs=[ticket_preview, ticket_url, ticket_body],
                 )
-
                 save_btn.click(
                     fn=save_issue_draft,
                     inputs=[ticket_preview, ticket_url, ticket_body],
                     outputs=[save_status],
                 )
 
-            # ---- TAB 4: CONFIGURE ----
-            with gr.Tab("⚙️ Configure Labels"):
-                gr.Markdown("## Default Categories")
+            # ----------------------------------------------------------------
+            # TAB 4: API DEBUG
+            # ----------------------------------------------------------------
+            with gr.Tab("🔬 API Debug"):
+                gr.Markdown("## infini-gram API Debugger\n")
                 gr.Markdown(
-                    "These are applied unless you override with custom JSON on the Analyze tab."
+                    f"Directly test any query against the infini-gram API "
+                    f"(`{INFINIGRAM_INDEX}` index at `{INFINIGRAM_API}`). "
+                    f"Shows the exact request, the full raw HTTP response, "
+                    f"parsed counts, sample documents, and sub-phrase signal.\n\n"
+                    f"**Console** (where you launched the app) shows all API calls in real time."
                 )
-                for key, cat in DEFAULT_LABELS.items():
-                    gr.Markdown(f"### {cat['name']}")
-                    gr.Markdown(f"Labels: `{'`, `'.join(cat['labels'])}`")
-                    gr.Markdown(f"_{cat['description']}_")
 
-                gr.Markdown("---")
-                gr.Markdown("## Adding Custom Categories")
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        debug_query_input = gr.Textbox(
+                            label="Query string (sent verbatim to infini-gram)",
+                            value=MIT_TEST_PHRASE,
+                            lines=2,
+                        )
+                    with gr.Column(scale=1):
+                        gr.Markdown(
+                            "**Step 1 — baseline test:**\n\nRun the pre-filled MIT phrase. "
+                            "If count = 0, the API call itself is broken.\n\n"
+                            "**Step 2 — snippet test:**\n\nCopy one extracted line "
+                            "from the Check Snippet tab and test it here.\n\n"
+                            "**Step 3 — shorten it:**\n\nPick 4-6 words from a "
+                            "distinctive part and try those."
+                        )
+
+                debug_run_btn = gr.Button("▶ Run Query", variant="primary")
+
+                with gr.Tabs():
+                    with gr.Tab("📊 Summary"):
+                        debug_summary = gr.Markdown()
+                    with gr.Tab("📋 Raw JSON"):
+                        debug_raw = gr.Code(label="Full API response JSON", language="json")
+
+                debug_run_btn.click(
+                    fn=run_debug_query,
+                    inputs=[debug_query_input],
+                    outputs=[debug_summary, debug_raw],
+                )
+
+                gr.Markdown("---\n### Phrase Extraction Preview\n")
                 gr.Markdown(
-                    "Paste JSON into the Analyze tab. Each category needs a `name`, "
-                    "`labels` (list of strings), and optional `description`."
+                    "Shows exactly which lines get picked from your snippet "
+                    "and why — scores, skip reasons, and the final phrase sent to the API."
                 )
-                gr.Code(value=EXAMPLE_CUSTOM_JSON, language="json", interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        debug_snippet_input = gr.Textbox(
+                            label="Paste your snippet here",
+                            lines=8,
+                            placeholder="function createElement(type, config, children) {\n  var propName;\n  var props = {};\n  var key = null;\n  var ref = null;",
+                        )
+                    with gr.Column(scale=1):
+                        debug_extract_btn = gr.Button("🔍 Preview Extraction", variant="secondary")
 
-            # ---- TAB 5: ABOUT ----
+                debug_extraction_output = gr.Markdown()
+                debug_extract_btn.click(
+                    fn=preview_extraction,
+                    inputs=[debug_snippet_input],
+                    outputs=[debug_extraction_output],
+                )
+
+            # ----------------------------------------------------------------
+            # TAB 5: ABOUT
+            # ----------------------------------------------------------------
             with gr.Tab("ℹ️ About"):
                 gr.Markdown(INFO_MD)
 
@@ -1142,7 +929,10 @@ def build_ui():
 
 
 if __name__ == "__main__":
-    prewarm_model()  # Start loading OLMo into memory immediately at startup
     app = build_ui()
-    app.queue()  # Required for long-running inference — without this Gradio drops requests
-    app.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"))
+    app.queue()  # Required for generator functions (streaming status updates)
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"),
+    )
