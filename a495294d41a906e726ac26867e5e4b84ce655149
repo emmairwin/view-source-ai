@@ -1,0 +1,50 @@
+app.py
+  fef3f1d599cccf86 2-4,10,88,126-127,233,235,237-240,242-244,246,248,250-251,253,255-259,363-365,587,589-590,617,619,621-623,628-631,858-860,862-866,869-900,902-903,905-913,915-922
+  fcbcd51aa44d0b5e 583,585,601
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "a495294d41a906e726ac26867e5e4b84ce655149",
+  "prompts": {
+    "ad4b182ad8453a9c": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "e324b949-16e4-4832-a26e-c7f11d5846ed",
+        "model": "unknown"
+      },
+      "human_author": "sunnydeveloper <emma.irwin@gmail.com>",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 13,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    },
+    "fcbcd51aa44d0b5e": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "fc5d8440-d2d9-4462-b4fd-c788f14d7a8f",
+        "model": "unknown"
+      },
+      "human_author": "sunnydeveloper <emma.irwin@gmail.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 3,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "fef3f1d599cccf86": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "1c4463d7-b577-4ad1-bd3e-5154cafce986",
+        "model": "unknown"
+      },
+      "human_author": "sunnydeveloper <emma.irwin@gmail.com>",
+      "messages": [],
+      "total_additions": 1896,
+      "total_deletions": 231,
+      "accepted_lines": 827,
+      "overriden_lines": 2
+    }
+  }
+}
